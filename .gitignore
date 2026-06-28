@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Converter output / test artifacts
+data_mods/
+out/
+output/
+*.vox
+*.s3v
+!template_v13.vox        # keep the bundled template
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

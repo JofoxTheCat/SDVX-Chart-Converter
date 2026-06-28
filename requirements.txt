@@ -1,0 +1,6 @@
+# sdvx-chart-importer has no third-party Python dependencies.
+# It uses only the standard library.
+#
+# External tool required for audio conversion:
+#   ffmpeg  (must be on PATH)  -> https://ffmpeg.org/
+#   .s3v is an ASF container with WMA-Pro audio (2ch / 44.1 kHz).
