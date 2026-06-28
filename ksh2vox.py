@@ -368,11 +368,19 @@ def place_jackets(src_folder: str, out_folder: str, sid: int, slot_label: int):
         shutil.copyfile(src, dst)
 
 
+def _xml_escape(s: str) -> str:
+    """Escape for XML text and replace non-ASCII with numeric char references,
+    so the file stays valid even when written as shift_jis (matching the base
+    music_db) while preserving any Unicode title/artist."""
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return "".join(c if ord(c) < 128 else f"&#{ord(c)};" for c in s)
+
+
 def music_entry(sid, ascii_id, header, levels):
     """Build a music_db <music> entry. levels: {slot_index: level_int}."""
     def lvl(i): return levels.get(i, 0)
-    title = header.get("title", "Unknown")
-    artist = header.get("artist", "Unknown")
+    title = _xml_escape(header.get("title", "Unknown"))
+    artist = _xml_escape(header.get("artist", "Unknown"))
     return f"""  <music id="{sid}">
     <info>
       <label>{sid}</label>
@@ -393,11 +401,46 @@ def music_entry(sid, ascii_id, header, levels):
   </music>"""
 
 
-def convert_song(folder: str, sid: int, out_root: str):
+def _read_existing_entries(path: str) -> dict:
+    """Parse existing <music id=…> blocks from a merged db into {id: block}."""
+    if not os.path.exists(path):
+        return {}
+    for enc in ("shift_jis", "cp932", "utf-8"):
+        try:
+            with open(path, encoding=enc, errors="ignore") as fh:
+                content = fh.read()
+            break
+        except Exception:
+            content = ""
+    out = {}
+    for mb in re.finditer(r'(<music id="(\d+)">.*?</music>)', content, re.DOTALL):
+        out[int(mb.group(2))] = mb.group(1)
+    return out
+
+
+def update_merged_db(merged_path: str, sid: int, entry_xml: str,
+                     encoding: str = "shift_jis") -> int:
+    """Create or update music_db.merged.xml, adding/replacing this song's entry.
+    Returns the total number of songs in the merged db. ifs_layeredfs merges
+    this file into the base music_db at load time (root <mdb>, one <music> per
+    song)."""
+    os.makedirs(os.path.dirname(os.path.abspath(merged_path)), exist_ok=True)
+    entries = _read_existing_entries(merged_path)
+    entries[sid] = entry_xml                       # add or replace
+    body = "\n".join(entries[k] for k in sorted(entries))
+    doc = (f'<?xml version="1.0" encoding="{encoding}"?>\n'
+           f'<mdb>\n{body}\n</mdb>\n')
+    with open(merged_path, "w", encoding=encoding, errors="xmlcharrefreplace") as fh:
+        fh.write(doc)
+    return len(entries)
+
+
+def convert_song(folder: str, sid: int, out_root: str,
+                 merged_path: str | None = None, db_encoding: str = "shift_jis"):
     ksh_files = [f for f in os.listdir(folder) if f.lower().endswith(".ksh")]
     if not ksh_files:
         print(f"[ERROR] no .ksh files in {folder}")
-        return
+        return None
     header0 = parse_ksh(os.path.join(folder, ksh_files[0]))[0]
     ascii_id = _ascii_id(header0.get("title", os.path.basename(folder)))
     song_dir = os.path.join(out_root, f"{sid:04d}_{ascii_id}")
@@ -444,19 +487,79 @@ def convert_song(folder: str, sid: int, out_root: str):
     else:
         print("  [WARN] no audio file found in the song folder.")
 
-    print(f"\n[DONE] {song_dir}")
-    print("\nAdd this entry to your music_db.merged.xml:\n")
-    print(music_entry(sid, ascii_id, header0, levels))
+    entry = music_entry(sid, ascii_id, header0, levels)
+
+    # Automatically create/update the merged music_db so the song actually loads.
+    if merged_path:
+        total = update_merged_db(merged_path, sid, entry, db_encoding)
+        print(f"  [db] merged music_db updated → {merged_path} ({total} song(s))")
+
+    print(f"[DONE] id {sid}: {song_dir}")
+    return entry
+
+
+def _default_merged_path(out_root: str) -> str:
+    """layeredfs merges data_mods/<mod>/others/music_db.merged.xml into the base
+    data/others/music_db.xml. With out = <mod>/music, the db lives in the
+    sibling <mod>/others/ folder."""
+    return os.path.join(os.path.dirname(os.path.abspath(out_root)),
+                        "others", "music_db.merged.xml")
+
+
+def convert_batch(parent: str, start_id: int, out_root: str,
+                  merged_path: str, db_encoding: str = "shift_jis"):
+    """Convert every song sub-folder under `parent` (each containing .ksh files),
+    assigning sequential ids from start_id. Builds one merged db for the lot."""
+    subs = sorted(d for d in os.listdir(parent)
+                  if os.path.isdir(os.path.join(parent, d))
+                  and any(f.lower().endswith(".ksh")
+                          for f in os.listdir(os.path.join(parent, d))))
+    if not subs:
+        print(f"[ERROR] no song sub-folders with .ksh found under {parent}")
+        return
+    print(f"[BATCH] {len(subs)} song(s) under {parent}, ids from {start_id}\n")
+    sid = start_id
+    done = 0
+    for d in subs:
+        print(f"── [{done + 1}/{len(subs)}] {d}  (id {sid})")
+        if convert_song(os.path.join(parent, d), sid, out_root,
+                        merged_path, db_encoding):
+            done += 1
+            sid += 1
+        print()
+    print(f"[BATCH DONE] {done} song(s) imported; merged db: {merged_path}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="KSH (Nautica) → VOX v13 (Nabla) converter")
-    ap.add_argument("folder", help="KSH song folder (contains .ksh + .ogg + jacket)")
-    ap.add_argument("--id", type=int, required=True, help="song id (use a free range, e.g. 9001+)")
+    ap = argparse.ArgumentParser(
+        description="sdvx-chart-importer — Nautica KSH → SDVX ∇ (VOX v13) + music_db")
+    ap.add_argument("folder", help="a KSH song folder, or (with --batch) a parent "
+                                    "folder of many song folders")
+    ap.add_argument("--id", type=int, required=True,
+                    help="song id (single) or starting id (--batch); use 9001+")
     ap.add_argument("--out", default="./data_mods/nautica/music",
-                    help="output root (default ./data_mods/nautica/music)")
+                    help="song output root (default ./data_mods/nautica/music)")
+    ap.add_argument("--db", default=None,
+                    help="music_db.merged.xml path "
+                         "(default <out>/../others/music_db.merged.xml; "
+                         "'none' disables auto-merge)")
+    ap.add_argument("--db-encoding", default="shift_jis",
+                    help="merged db encoding (default shift_jis, matches the game)")
+    ap.add_argument("--batch", action="store_true",
+                    help="treat <folder> as a parent of many song folders")
     a = ap.parse_args()
-    convert_song(a.folder, a.id, a.out)
+
+    if a.db is None:
+        merged = _default_merged_path(a.out)
+    elif a.db.lower() == "none":
+        merged = None
+    else:
+        merged = a.db
+
+    if a.batch:
+        convert_batch(a.folder, a.id, a.out, merged, a.db_encoding)
+    else:
+        convert_song(a.folder, a.id, a.out, merged, a.db_encoding)
 
 
 if __name__ == "__main__":

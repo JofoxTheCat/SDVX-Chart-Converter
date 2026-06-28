@@ -15,21 +15,45 @@ FORMAT VERSION 13** (Nabla / SDVX VII).
 
 ## Usage
 
+Single song:
+
 ```
 python ksh2vox.py <ksh_song_folder> --id 9001 --out ./data_mods/nautica/music
 ```
 
-- `<ksh_song_folder>`: one `.ksh` per difficulty (`nov/adv/exh/mxm`, optionally
-  `inf`), the audio (`.ogg`) and the jacket(s).
-- `--id`: a free song id — use a high range (e.g. `9001+`) so it never clashes
-  with the base game or omnimix.
-- Output: `<out>/<id>_<ascii>/` containing `_1n/_2a/_3e/_4i/_5m.vox`, the `.s3v`
-  audio + preview, and `jk_<id>_<n>.png` jackets. The `<music>` entry is printed
-  to stdout.
+Whole Nautica pack at once (a parent folder of many song folders):
 
-Then: add the printed `<music>` block to your `music_db.merged.xml`, place the
-song folder under your `data_mods/.../music/`, and make sure the launcher loads
-the ifs hook (`"spice_hooks": ["ifs_hook.dll"]` or `"load_ifs_hook": true`).
+```
+python ksh2vox.py <pack_folder> --batch --id 9001 --out ./data_mods/nautica/music
+```
+
+- `<ksh_song_folder>`: one `.ksh` per difficulty (`nov/adv/exh/mxm`, optionally
+  `inf`), the audio (any format) and the jacket(s).
+- `--id`: a free song id (single) or the **starting** id (`--batch`, incremented
+  per song). Use a high range (e.g. `9001+`) so it never clashes with the base
+  game or omnimix.
+- `--out`: song output root. Each song lands in `<out>/<id>_<ascii>/` with
+  `_1n/_2a/_3e/_4i/_5m.vox`, the `.s3v` audio + preview, and `jk_<id>_<n>.png`.
+
+### The merged music_db is built automatically
+
+The importer **creates and maintains `music_db.merged.xml` for you** — no manual
+copy-paste. By default it is written next to the songs at
+`<out>/../others/music_db.merged.xml` (i.e. `data_mods/nautica/others/`), which
+is exactly where **ifs_layeredfs** merges it into the base `data/others/
+music_db.xml`. Each run adds or replaces that song's `<music>` entry (re-running
+the same id is safe — no duplicates), so you can build the db up song by song or
+all at once with `--batch`.
+
+- `--db <path>`: write the merged db somewhere else (e.g. straight into an
+  existing `data_mods/omnimix/others/music_db.merged.xml`).
+- `--db none`: disable auto-merge (just emit the song files).
+- `--db-encoding`: defaults to `shift_jis` to match the game; Unicode titles are
+  preserved as XML numeric character references.
+
+Then just make sure the launcher loads the ifs hook
+(`"spice_hooks": ["ifs_hook.dll"]` or `"load_ifs_hook": true`) and the songs
+appear in-game.
 
 ## What converts cleanly vs. by default
 
