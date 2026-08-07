@@ -1,0 +1,4 @@
+# .vox files are game data, not source text. The game's parser expects CRLF and
+# breaks on \r\r\n, so these must never be line-ending-normalized — the bundled
+# template has to check out byte-identical on Windows and Linux alike.
+*.vox -text

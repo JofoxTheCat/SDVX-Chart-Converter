@@ -1,6 +1,12 @@
-# sdvx-chart-importer has no third-party Python dependencies.
-# It uses only the standard library.
+# sdvx-chart-importer — Python dependencies
 #
-# External tool required for audio conversion:
+# Pillow is used to resize jackets to the sizes the game expects
+# (300 / 676 / 108 px). Without it the conversion still runs, but jackets
+# are copied through unresized.
+Pillow>=10.0
+
+# External tool, not installable via pip:
 #   ffmpeg  (must be on PATH)  -> https://ffmpeg.org/
-#   .s3v is an ASF container with WMA-Pro audio (2ch / 44.1 kHz).
+#   Audio is written as .2dx / MS-ADPCM, which ffmpeg can encode on both
+#   Windows and Linux. The optional .s3v format is WMA Pro and needs an
+#   external encoder (--wma-encoder); ffmpeg cannot encode it.

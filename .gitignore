@@ -11,7 +11,10 @@ out/
 output/
 *.vox
 *.s3v
-!template_v13.vox        # keep the bundled template
+*.2dx
+# keep the bundled template (this negation must stay on its own line —
+# git does not support trailing comments in .gitignore)
+!template_v13.vox
 
 # OS / editor
 .DS_Store
