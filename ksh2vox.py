@@ -23,8 +23,12 @@ music_db.merged.xml.
 Only for legitimate use: your own or user-generated Nautica charts. Do not use it
 to extract or redistribute proprietary game data.
 """
-__version__ = "0.17.0"
+__version__ = "0.17.1"
 
+# 0.17.1 A ranged ksh `t=35-321` header is the display range only, never a
+#        tempo event (libkson); before, its low value sat at tick 0 next to
+#        the first inline tempo and radar.py counted that as a tempo change
+#        (TRICKY too high on AureoLe / Canto IX). VOX output unchanged.
 # 0.17.0 What used to be lost in VOX, each mapping measured on the 336 official
 #        v13 charts: wide lasers (field 6 = 2; kson `w`, ksh laserrange=2x),
 #        kson laser curves baked every 3 ticks with the curve type in field 8,
@@ -242,6 +246,18 @@ def parse_ksh(path: str):
     return header, measures
 
 
+def _ksh_header_bpm(value):
+    """(bpm, ranged) from a ksh `t=` header, or None. `t=35-321` is a display
+    range: (35.0, True) — the caller must not turn it into a tempo event."""
+    if not value:
+        return None
+    parts = str(value).split("-")
+    try:
+        return float(parts[0]), len(parts) > 1
+    except ValueError:
+        return None
+
+
 def _measure_lengths(measures):
     """Return per-measure (beat_num, beat_den) honouring inline `beat=` options."""
     num, den = 4, 4
@@ -267,12 +283,15 @@ def convert_chart(ksh_path: str) -> dict:
     bpm_events = []                # (tick, bpm)
     beat_events = []               # (measure_idx, num, den)
 
-    # initial bpm
-    if header.get("t"):
-        try:
-            bpm_events.append((0, float(header["t"].split("-")[0])))
-        except ValueError:
-            pass
+    # initial bpm. A ranged header (`t=35-321`) is the song-select display
+    # range only, never a tempo (libkson's InsertBPMChange skips values with a
+    # '-'); the chart's own first inline `t=` is the starting tempo — moved to
+    # tick 0 below if it comes later. Until 0.17.1 the range's low value became
+    # an event at tick 0, which emit_vox dedupes away but radar.py read as an
+    # extra tempo change (inflated TRICKY).
+    header_bpm = _ksh_header_bpm(header.get("t"))
+    if header_bpm is not None and not header_bpm[1]:
+        bpm_events.append((0, header_bpm[0]))
 
     tick = 0
     bt_hold = [None] * 4           # open hold start tick per BT lane
@@ -306,7 +325,7 @@ def convert_chart(ksh_path: str) -> dict:
         li = 0
         for ln in m:
             mt = re.match(r"t=([0-9.]+)", ln)
-            if mt:
+            if mt and "-" not in ln:          # a ranged inline t= is no tempo either
                 bpm_events.append((tick + (li * ticks_in_measure // n), float(mt.group(1))))
             if not re.match(r"^[0-9\-:]{4}\|", ln):
                 if "=" in ln and not ln.startswith("//"):
@@ -401,6 +420,14 @@ def convert_chart(ksh_path: str) -> dict:
         for m, code in zip(laser_meta[k],
                            _section_filters(parsed, laser[k], filter_events)):
             m["filter"] = code
+
+    if bpm_events and bpm_events[0][0] > 0 and header_bpm and header_bpm[1]:
+        # ranged header, first inline tempo later in the chart: it applies from
+        # the start (libkson / the chart editor), not the header's low value
+        bpm_events[0] = (0, bpm_events[0][1])
+    if not bpm_events and header_bpm:
+        # no inline tempo at all: the header is all there is (range → low value)
+        bpm_events.append((0, header_bpm[0]))
 
     end_tick = tick
     parsed.update({
@@ -1758,6 +1785,21 @@ def _check_extras() -> list[str]:
             fh.write("title=t\nt=120\n--\nlaserrange_l=2x\n0000|00|0-\n0000|00|--\n"
                      "0000|00|0-\n0000|00|--\n--\n")
         widths = [x["wide"] for x in convert_chart(k)["laser_meta"][0]]
+        # 0.17.1: a ranged t= header is display-only, never a tempo event;
+        # a later first inline tempo applies from tick 0.
+        bpms = []
+        for body in ("--\nt=321\n0000|00|--\n--\nt=35\n0000|00|--\n--\n",
+                     "--\n0000|00|--\nt=321\n0000|00|--\n--\n",
+                     "--\n0000|00|--\n--\n"):
+            with open(k, "w", encoding="utf-8") as fh:
+                fh.write("title=t\nt=35-321\n" + body)
+            bpms.append(convert_chart(k)["bpm"])
+    if bpms != [[(0, 321.0), (192, 35.0)], [(0, 321.0)], [(0, 35.0)]]:
+        bad.append(f"ranged t= header {bpms}")
+    if _radar is not None and _radar.raw_stats(
+            {"bt": [[]] * 4, "fx": [[], []], "laser": [[], []], "end": 192,
+             "bpm": [(0, 35.0), (0, 321.0)]})["bpm_inverse_differences"] != 0:
+        bad.append("radar: same-tick BPM events not deduped")
     if widths != [2, 1]:
         bad.append(f"laserrange reset {widths} != [2, 1]")
     # malformed editor data warns instead of raising
@@ -3276,7 +3318,8 @@ def main():
         print("  0.17 extras : " + ("ok (curve bake, FX block index + overflow, stop "
                                     "rows, laserrange reset, malformed editor data, "
                                     "-0.00, ManualSpeed in LOCKED_SPCONTROLER, "
-                                    "POSTEFFECT length 0, scroll ramp bound)"
+                                    "POSTEFFECT length 0, scroll ramp bound, "
+                                    "ranged t= header, radar BPM dedupe)"
                                     if not bad else "FAILED — " + "; ".join(bad)))
         try:
             from PIL import Image  # noqa: F401

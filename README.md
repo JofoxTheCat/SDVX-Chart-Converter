@@ -103,7 +103,7 @@ named `mxm` while the header still says `infinite`.
 
 | Part | Result |
 |------|--------|
-| Timing / BPM / time signatures | exact (both tick-based; KSH line → VOX 48-tick grid) |
+| Timing / BPM / time signatures | exact (both tick-based; KSH line → VOX 48-tick grid); a ranged ksh header `t=35-321` is only the song-select display range, the first inline `t=` is the starting tempo (0.17.1) |
 | BT notes (chip + hold) | exact |
 | FX notes (chip + hold) | positions exact; hold effects mapped to the chart's 12-block effect table (since 0.17.0) |
 | Laser paths | scaled exactly (KSH 0–50 → VOX 0.0–1.0) |

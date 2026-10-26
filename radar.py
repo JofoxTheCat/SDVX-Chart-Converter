@@ -20,7 +20,7 @@ Tunables are module constants so they can be adjusted without touching logic.
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 TPB = 48                     # ticks per beat (matches ksh2vox)
 
@@ -40,10 +40,22 @@ RADAR_KEYS = ("notes", "peak", "tsumami", "tricky", "hand_trip", "one_hand")
 
 
 # ── tick ↔ time ──────────────────────────────────────────────────────────────
+def _bpm_changes(bpm_events):
+    """One BPM per tick, the later event in the list wins — exactly what
+    ksh2vox.emit_vox writes to #BPM INFO — sorted by tick. Plain sorting kept
+    same-tick duplicates: ksh2vox < 0.17.1 emitted a ranged ksh header
+    (`t=35-321`) as an extra event at tick 0, which counted as a tempo change
+    (inflated TRICKY) and, sorted by value, let the higher BPM win the timing."""
+    uniq = {}
+    for t, b in bpm_events:
+        uniq[t] = b
+    return sorted(uniq.items())
+
+
 def _tick_to_seconds_fn(bpm_events):
     """Build tick→seconds using the chart's BPM changes.
     bpm_events: [(tick, bpm), ...] (unsorted ok)."""
-    ev = sorted(bpm_events) or [(0, 120.0)]
+    ev = _bpm_changes(bpm_events) or [(0, 120.0)]
     if ev[0][0] != 0:
         ev.insert(0, (0, ev[0][1]))
     # cumulative seconds at each bpm change
@@ -180,7 +192,7 @@ def raw_stats(parsed: dict) -> dict:
             adlr_jacks += n
 
     # sofulan: how strongly note spacing is distorted by BPM changes
-    ev = sorted(parsed["bpm"]) or [(0, 120.0)]
+    ev = _bpm_changes(parsed["bpm"]) or [(0, 120.0)]
     bpm_inverse_differences = sum(
         abs(1.0 / (b[1] or 120.0) - 1.0 / (a[1] or 120.0))
         for a, b in zip(ev, ev[1:]))

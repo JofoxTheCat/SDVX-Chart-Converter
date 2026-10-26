@@ -11,6 +11,52 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.17.1] - 2026-10-26
+
+### Fixed
+- **Ranged ksh tempo header inflated TRICKY.** A .ksh whose header declares a
+  tempo range (`t=35-321`) and whose first inline tempo is `t=321` was parsed
+  to the BPM events `[(0, 35), (0, 321), …]`: the range's low value became a
+  tempo at tick 0. `emit_vox` keeps one BPM per tick (last wins), so the VOX was
+  always right, but `radar.py` read the raw list and counted a spurious
+  |1/321 − 1/35| tempo change into TRICKY. A ranged header is now what it is in
+  K-Shoot (libkson's `InsertBPMChange` skips a value with a `-`): the
+  song-select display range only, never a tempo event. If the first inline
+  tempo comes after tick 0 it applies from tick 0 (libkson, the chart editor);
+  only a chart with no inline tempo at all falls back to the range's low value.
+  A plain header (`t=180`) is unchanged. The music_db `bpm_min`/`bpm_max`
+  display range still comes from the header, as before.
+- `radar.py` 0.1.1 dedupes same-tick BPM events (last wins, exactly what
+  `emit_vox` writes to `#BPM INFO`) before computing timing and the tempo-change
+  statistic. Plain sorting also let the *higher* of two same-tick tempos win
+  the tick → seconds mapping.
+
+### Verified
+- Full conversion of the 8-song / 24-chart Nautica library with 0.17.0 and
+  0.17.1 into scratch folders: every `.vox`, `.2dx` and jacket is byte-identical
+  (BPM INFO unchanged); the merged music_db differs only in TRICKY, and
+  `import_map.json` only in `converter`. NOTES, PEAK, TSUMAMI, HAND-TRIP,
+  ONE-HAND and `bpm_min`/`bpm_max` are unchanged everywhere.
+
+  | Chart | header / first inline | TRICKY 0.17.0 → 0.17.1 |
+  |---|---|---|
+  | AureoLe EXH | `35-321` / `321` | 171 → 140 |
+  | AureoLe MXM | `35-321` / `321` | 323 → 292 |
+  | Canto IX NOV | `70-97` / `91` | 32 → 24 |
+  | Canto IX ADV | `70-97` / `91` | 32 → 24 |
+  | Canto IX EXH | `70-97` / `91` | 33 → 24 |
+  | Canto IX MXM | `70-97` / `91` | 62 → 54 |
+
+  Aegleseeker (`234-1872` / `234`) is unchanged: the low value equals the first
+  inline tempo, so the old extra event was no change.
+- `--self-check` covers the ranged header (inline tempo at 0, later, absent)
+  and the radar dedupe.
+- Bumped because the music_db output changes: every song re-converts once on
+  the next import (the converter version is part of the `import_map.json`
+  up-to-date check).
+
+---
+
 ## [0.17.0] - 2026-10-26
 
 Everything below used to be dropped on the way to VOX. Each mapping was
