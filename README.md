@@ -105,14 +105,27 @@ named `mxm` while the header still says `infinite`.
 |------|--------|
 | Timing / BPM / time signatures | exact (both tick-based; KSH line → VOX 48-tick grid) |
 | BT notes (chip + hold) | exact |
-| FX notes (chip + hold) | positions exact; **effect = default** |
+| FX notes (chip + hold) | positions exact; hold effects mapped to the chart's 12-block effect table (since 0.17.0) |
 | Laser paths | scaled exactly (KSH 0–50 → VOX 0.0–1.0) |
 | Laser sections / slams | sections opened and closed correctly; slams snap |
+| Wide lasers (`laserrange_*=2x`, kson `w`) | width 2, values over the wide range (0.17.0); a ksh `laserrange` widens only the next section |
+| Laser curves (kson `[a, b]`) | baked into points every 3 ticks like official charts (0.17.0); a `.ksh` already carries K-Shoot's own baked points |
+| Laser filters (`filtertype`, kson `pulse_event`) | peak / low-pass / high-pass / bit crusher (0.17.0); other laser effects fall back to peak with a warning |
+| Tilt | auto modes normal / bigger / keep_bigger, manual tilt as `Tilt` rows (0.17.0) |
+| Camera `zoom_top` / `zoom_bottom` | `CAM_RotX` / `CAM_Radi` rows, clamped to the official ±1 (0.17.0) |
+| Scroll speed / stops | `ManualSpeed` rows in `#LOCKED_SPCONTROLER` (official v13 form) / `4-` BPM rows (0.17.0) |
 | Skill radar | computed per chart (see below) |
-| FX/filter effect parameters, camera, tilt | **defaults** (from `template_v13.vox`) |
+| Effect parameter changes, spins, `zoom_side`, `center_split`, custom key sounds | not representable — reported once per chart |
 
-The error-prone parts intentionally fall back to neutral defaults — fine-tuning
-is a job for a later editor pass, not the auto-importer.
+Each mapping was measured against the official v13 charts; the ones that still
+need an in-game test are listed in `CHANGELOG.md` under 0.17.0. A chart without
+any of these keeps the template's defaults verbatim.
+
+Charts saved by the SDVX Chart Editor can carry VOX-only data in
+`impl["sdvx-editor"].vox` (background `bg_no`, `#POSTEFFECT` and
+`#SPCONTROLER` rows); it is used when present. Malformed entries there are
+skipped with a warning. In a batch, a song whose conversion fails is reported
+and the remaining songs still convert.
 
 ## Skill radar
 
@@ -169,7 +182,8 @@ first. Without Pillow the source image is copied through unresized.
 - Custom songs need a local/compatible **Asphyxia** that serves the custom ids,
   and the WebUI song assets may need updating.
 - `template_v13.vox` is a generic default scaffold (effect/camera sections only,
-  no chart notes) used to emit valid v13 files.
+  no chart notes) used to emit valid v13 files. Its tables are the defaults; a
+  chart's own effects, tilt and camera replace the matching sections.
 - **Legitimate use only:** your own or user-generated Nautica charts. Do not use
   this to extract or redistribute proprietary game data. SOUND VOLTEX and KONAMI
   trademarks belong to their respective owners; this is an unofficial,
