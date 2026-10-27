@@ -23,8 +23,11 @@ music_db.merged.xml.
 Only for legitimate use: your own or user-generated Nautica charts. Do not use it
 to extract or redistribute proprietary game data.
 """
-__version__ = "0.20.0"
+__version__ = "0.20.1"
 
+# 0.20.1 Song ids above every real song over several --base-db (the plugin
+#        json lags behind the game); a tilt jump inside one manual stretch
+#        is a 0-tick row like in the official charts.
 # 0.20.0 Game effects authored in the SDVX Chart Editor, written only with
 #        what the ∇ DLL reads (Ghidra RE 2026-10-27): #POSTEFFECT rows with
 #        stage / instance index / ms lengths (ChromaticAberration written
@@ -1469,6 +1472,37 @@ def _tilt_blocks(tweens: list) -> list:
     return out
 
 
+def _tilt_pieces(manual: list) -> list:
+    """Manual tilt points [(tick, v, vf, curve)] → tweens [(tick, dur, from, to)].
+
+    _graph_pieces plus the official encoding of an instant change (v != vf)
+    on a point that is followed by another one: a 0-tick row `t 0 v vf` right
+    before the segment that starts at t from vf. Under the Tilt grammar every
+    row only adds a key at its start with its FROM value, so without that row
+    the key v at t was lost — `[1.0, -1.0]` inside a manual stretch became a
+    ramp into -1.0 instead of reaching 1.0 and jumping (fixed in 0.20.1
+    was released). Measured on the official charts: all 31 zero-duration Tilt
+    rows (12 charts, 10 songs) change the value, 30 are followed by a row at
+    the same tick starting from their `to`, the 22 not opening a block chain
+    from the previous row's `to` — e.g. 0272 im so happy 4i
+    `002,04,00 Tilt 2 0 0.25 -0.25 0.00 0.00` then `002,04,00 Tilt 2 48 -0.25
+    -0.25 …`. Two blocks touching at one tick with a different value occur
+    only twice (one chart), so a jump stays inside its block. The last point
+    already got its 0-tick row from _graph_pieces."""
+    pieces = _graph_pieces(manual, 12)
+    jumps = {t: (v, vf) for i, (t, v, vf, _c) in enumerate(manual[:-1])
+             if v != vf and manual[i + 1][0] > t}
+    if not jumps:
+        return pieces
+    out = []
+    for p in pieces:
+        j = jumps.pop(p[0], None)       # the first piece at t starts point t
+        if j is not None:
+            out.append((p[0], 0, j[0], j[1]))
+        out.append(p)
+    return out
+
+
 def _tilt_emit(parsed: dict, events: list):
     """→ (TILT MODE rows [(tick, mode)], Tilt SPCONTROLER rows
     [(tick, dur, from, to, block flag)])."""
@@ -1480,7 +1514,7 @@ def _tilt_emit(parsed: dict, events: list):
         # hold row closes the block there (see the block marker above). Until
         # 0.19.0 a 0-tick reset row (last → 0) stood at the auto mode instead,
         # and a value held to the chart end had no row at all.
-        for t, d, a, b in _graph_pieces(manual, 12):
+        for t, d, a, b in _tilt_pieces(manual):
             if d == 0 and a == b:
                 continue                    # a lone point: the hold below says it
             tweens.append((t, d, _clamp_unit(parsed, a, "manual tilt"),
@@ -2565,6 +2599,51 @@ def _check_camera() -> list[str]:
                           (96, "manual", 0.0, 0.0, None)])
     if [r[4] for r in tw] != [TILT_START, TILT_MIDDLE, TILT_END] or tw[-1][:2] != (96, 672):
         bad.append(f"tilt block middle {tw}")
+    # An instant change inside a manual stretch (kson [1.0, -1.0]): a 0-tick
+    # row v → vf at the jump, then the next row from vf — the official form.
+    _, tw = _tilt_emit(q, [(0, "manual", 0.5, 0.5, None), (96, "manual", 1.0, -1.0, None),
+                          (192, "manual", -1.0, -1.0, None), (288, "auto", "normal")])
+    if tw != [(0, 96, 0.5, 1.0, TILT_START), (96, 0, 1.0, -1.0, TILT_MIDDLE),
+              (96, 96, -1.0, -1.0, TILT_MIDDLE), (192, 96, -1.0, -1.0, TILT_END)]:
+        bad.append(f"tilt jump inside a block {tw}")
+    return bad
+
+
+def _with_quiet_stdout(fn):
+    """Run a self-check whose code under test prints its usual warnings."""
+    import contextlib
+    import io
+    with contextlib.redirect_stdout(io.StringIO()):
+        return fn()
+
+
+def _check_ids() -> list[str]:
+    """Id floor over several base dbs + retiring an unsafe remembered id,
+    run by --self-check (fixed in 0.20.1)."""
+    import tempfile
+    bad = []
+    mus = lambda i, t: f'<music id="{i}"><info><title_name>{t}</title_name></info></music>'
+    with tempfile.TemporaryDirectory() as d:
+        j, x, c = (os.path.join(d, n) for n in ("music_db.json", "music_db.xml", "cache.xml"))
+        merged = os.path.join(d, "mod", "others", "music_db.merged.xml")
+        out = os.path.join(d, "mod", "music")
+        with open(j, "w", encoding="utf-8") as fh:
+            json.dump({"mdb": {"music": [{"id": 5}, {"id": 9, "info": {"nautica": True}}]}}, fh)
+        with open(x, "w", encoding="cp932") as fh:
+            fh.write(f"<mdb>{mus(3, 'a')}{mus(7, 'b')}</mdb>")
+        with open(c, "w", encoding="cp932") as fh:           # layeredfs cache
+            fh.write(f"<mdb>{mus(7, 'b')}{mus(10, 'ours')}</mdb>")
+        update_merged_db(merged, 10, mus(10, "ours"))
+        update_merged_db(merged, 6, mus(6, "old"))
+        if (max_real_id(j), max_real_id([j, x]), max_real_id([j, x, c], merged),
+                max_real_id([merged], merged)) != (5, 7, 7, 0):
+            bad.append("max real id over several bases")
+        os.makedirs(os.path.join(out, "0006_x"))
+        imap = {"songs": {"song": {"id": 6, "ascii": "x"}}}
+        got = assign_song_id(imap, os.path.join(d, "song"), 8, out, merged)
+        if got != (8, True) or os.path.isdir(os.path.join(out, "0006_x")) \
+                or set(_read_existing_entries(merged)) != {10}:
+            bad.append(f"unsafe remembered id not retired {got}")
     return bad
 
 
@@ -3697,6 +3776,23 @@ def update_merged_db(merged_path: str, sid: int, entry_xml: str,
     os.makedirs(os.path.dirname(os.path.abspath(merged_path)), exist_ok=True)
     entries = _read_existing_entries(merged_path)
     entries[sid] = entry_xml                       # add or replace
+    _write_merged_db(merged_path, entries, encoding)
+    return len(entries)
+
+
+def remove_merged_entry(merged_path: str, sid: int,
+                        encoding: str = "Shift_JIS") -> bool:
+    """Drop one id from the merged db (written exactly like update_merged_db).
+    Returns whether there was an entry."""
+    entries = _read_existing_entries(merged_path)
+    if sid not in entries:
+        return False
+    del entries[sid]
+    _write_merged_db(merged_path, entries, encoding)
+    return True
+
+
+def _write_merged_db(merged_path: str, entries: dict, encoding: str) -> None:
     body = "\n".join(entries[k] for k in sorted(entries))
     doc = (f'<?xml version="1.0" encoding="{encoding}"?>\n'
            f'<mdb>\n{body}\n</mdb>\n')
@@ -3711,7 +3807,6 @@ def update_merged_db(merged_path: str, sid: int, entry_xml: str,
     with open(merged_path, "w", encoding=write_codec,
               errors="replace", newline="") as fh:
         fh.write(doc)
-    return len(entries)
 
 
 def song_ascii_id(header: dict, sid: int) -> str:
@@ -4026,7 +4121,7 @@ def folder_fingerprint(folder: str) -> str:
 
 
 def is_up_to_date(imap: dict, folder: str, out_root: str,
-                  merged_ids=None) -> bool:
+                  merged_ids=None, floor_id: int | None = None) -> bool:
     """True when this song can be skipped entirely.
 
     Every condition has to hold:
@@ -4035,10 +4130,15 @@ def is_up_to_date(imap: dict, folder: str, out_root: str,
         fix (slams, CRLF, jackets, credits …) would silently never reach
         already-imported songs, which is the worst possible failure here,
       * the output folder still exists and holds at least one .vox,
-      * the merged db still has an entry for that id.
+      * the merged db still has an entry for that id,
+      * the id is still safe: not below `floor_id` (the first id above every
+        real song) — otherwise an unchanged song would be skipped and keep
+        an id the game now gives to a real song; assign_song_id moves it.
     """
     entry = (imap.get("songs") or {}).get(map_key(folder))
     if not isinstance(entry, dict) or not isinstance(entry.get("id"), int):
+        return False
+    if floor_id is not None and not floor_id <= entry["id"] <= MAX_SONG_ID:
         return False
     if entry.get("converter") != __version__:
         return False
@@ -4075,13 +4175,20 @@ def record_import(imap: dict, folder: str, sid: int, song_dir: str) -> None:
     entry["radar"] = _radar_setting()
 
 
-def assign_song_id(imap: dict, folder: str, floor_id: int) -> tuple[int, bool]:
+def assign_song_id(imap: dict, folder: str, floor_id: int,
+                   out_root: str | None = None, merged_path: str | None = None,
+                   db_encoding: str = "Shift_JIS") -> tuple[int, bool]:
     """Return (id, is_new) for a song folder, remembering the choice.
 
     `floor_id` is the first id that is safe to use — one above every real
     (non-custom) song, from --base-db. Already-mapped songs keep their id even
     if floor_id moved, unless that id would now collide with a real song, in
-    which case it is reallocated and the caller re-converts that song."""
+    which case it is reallocated and the caller re-converts that song.
+
+    With `out_root` / `merged_path` the unsafe id is also retired at once:
+    its entry leaves the merged db (layeredfs would otherwise lay it over the
+    real song with that id) and its output folder is removed. That happens
+    even if the re-conversion then fails — the old id is wrong either way."""
     songs = imap.setdefault("songs", {})
     key = map_key(folder)
     entry = songs.get(key)
@@ -4090,6 +4197,7 @@ def assign_song_id(imap: dict, folder: str, floor_id: int) -> tuple[int, bool]:
             return entry["id"], False
         print(f"  [warn] remembered id {entry['id']} for '{key}' is no longer "
               f"safe (real songs now reach {floor_id - 1}) — reassigning")
+        _retire_id(entry, out_root, merged_path, db_encoding)
     taken = {e["id"] for e in songs.values()
              if isinstance(e, dict) and isinstance(e.get("id"), int)}
     sid = floor_id
@@ -4097,6 +4205,21 @@ def assign_song_id(imap: dict, folder: str, floor_id: int) -> tuple[int, bool]:
         sid += 1
     songs[key] = {"id": sid}
     return sid, True
+
+
+def _retire_id(entry: dict, out_root: str | None, merged_path: str | None,
+               db_encoding: str = "Shift_JIS") -> None:
+    """Remove what a song wrote under an id it no longer owns."""
+    old = entry["id"]
+    if merged_path and os.path.isfile(merged_path) and \
+            remove_merged_entry(merged_path, old, db_encoding):
+        print(f"  [warn] id {old} removed from {os.path.basename(merged_path)}")
+    ascii_id = entry.get("ascii")
+    if out_root and ascii_id and re.fullmatch(r"[a-z0-9_]+", ascii_id):
+        song_dir = os.path.join(out_root, f"{old:04d}_{ascii_id}")
+        if os.path.isdir(song_dir):
+            shutil.rmtree(song_dir)
+            print(f"  [warn] old output folder {os.path.basename(song_dir)} removed")
 
 
 def _release_failed_id(imap: dict, path: str, sid: int, out_root: str) -> None:
@@ -4156,14 +4279,16 @@ def convert_batch(parent: str, start_id: int, out_root: str,
     _emit(progress, "batch_start", total=len(subs), mapped=known)
     for i, d in enumerate(subs):
         path = os.path.join(parent, d)
-        if not force and is_up_to_date(imap, path, out_root, merged_ids):
+        if not force and is_up_to_date(imap, path, out_root, merged_ids,
+                                       floor_id=start_id):
             sid = imap["songs"][map_key(path)]["id"]
             skipped += 1
             print(f"── [{i + 1}/{len(subs)}] {d}  (id {sid}) — unchanged, skipped")
             _emit(progress, "song_skipped", index=i, total=len(subs),
                   folder=d, song_id=sid)
             continue
-        sid, is_new = assign_song_id(imap, path, start_id)
+        sid, is_new = assign_song_id(imap, path, start_id, out_root,
+                                     merged_path, db_encoding)
         tag = "new" if is_new else "known"
         print(f"── [{i + 1}/{len(subs)}] {d}  (id {sid}, {tag})")
         _emit(progress, "song_start", index=i, total=len(subs),
@@ -4209,28 +4334,104 @@ def convert_batch(parent: str, start_id: int, out_root: str,
             "failed": failed, "map_path": map_path}
 
 
-def _max_existing_id(path: str) -> int:
-    """Highest song id in a base music_db (json or xml). Used to pick custom ids
-    that sit just above all real songs — avoiding both collisions and the array
-    overflow that very high ids (e.g. 9001) trigger in the game at boot."""
+def _decode_db(data: bytes) -> str:
+    for enc in ("cp932", "shift_jis", "utf-8"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+_TITLE_RE = re.compile(r"<title_name>(.*?)</title_name>", re.DOTALL)
+
+
+def _own_titles(own_db: str | None) -> dict:
+    """{id: title} of the converter's own merged db (empty when absent)."""
+    out = {}
+    for sid, block in (_read_existing_entries(own_db) if own_db else {}).items():
+        m = _TITLE_RE.search(block)
+        out[sid] = m.group(1).strip() if m else None
+    return out
+
+
+def base_db_ids(path: str, own_db: str | None = None) -> dict:
+    """What one base music_db contributes to the id floor.
+
+    → {path, kind: json|xml, max_id, songs, own, ignored}. `songs` counts the
+    real songs, `own` the custom songs left out, `ignored` is a reason when the
+    whole file is the converter's own output.
+
+    Real songs only. In the plugin's music_db.json the custom songs carry
+    info.nautica; a music_db.xml has no such flag, so a file that IS a merged
+    db (the converter's `own_db`, or any `*.merged.xml`) counts for nothing,
+    and in another xml — layeredfs's `_cache/others/music_db.xml` holds the
+    game's songs and ours merged — an entry whose id and title match an entry
+    of `own_db` is ours. The game's own data/others/music_db.xml is never
+    rewritten by layeredfs, so it holds real songs only."""
     data = open(path, "rb").read()
-    head = data[:200].lstrip()
-    if head[:1] == b"{":                       # music_db.json
-        import json as _json
-        db = _json.loads(data.decode("utf-8", "replace"))
-        ids = [int(m["id"]) for m in db.get("mdb", {}).get("music", [])
-               if not (isinstance(m.get("info"), dict) and m["info"].get("nautica"))]
-    else:                                       # music_db.xml / .merged.xml
-        for enc in ("cp932", "shift_jis", "utf-8"):
+    info = {"path": path, "kind": "xml", "max_id": 0, "songs": 0, "own": 0,
+            "ignored": None}
+    if data[:200].lstrip()[:1] == b"{":        # music_db.json
+        info["kind"] = "json"
+        db = json.loads(data.decode("utf-8", "replace"))
+        ids = []
+        for m in db.get("mdb", {}).get("music", []):
+            if isinstance(m.get("info"), dict) and m["info"].get("nautica"):
+                info["own"] += 1
+            else:
+                ids.append(int(m["id"]))
+    else:                                       # music_db.xml
+        same = False
+        if own_db and os.path.exists(own_db):
             try:
-                text = data.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
-            text = data.decode("utf-8", "replace")
-        ids = [int(i) for i in re.findall(r'<music id="(\d+)"', text)]
-    return max(ids) if ids else 0
+                same = os.path.samefile(path, own_db)
+            except OSError:
+                same = False
+        if same or os.path.basename(path).lower().endswith(".merged.xml"):
+            info["ignored"] = "the converter's own merged db holds custom songs only"
+            return info
+        own = _own_titles(own_db)
+        ids = []
+        text = _decode_db(data)
+        for m in re.finditer(r'<music id="(\d+)">(.*?)</music>', text, re.DOTALL):
+            sid = int(m.group(1))
+            t = _TITLE_RE.search(m.group(2))
+            if sid in own and (t.group(1).strip() if t else None) == own[sid]:
+                info["own"] += 1
+            else:
+                ids.append(sid)
+    info["songs"] = len(ids)
+    info["max_id"] = max(ids) if ids else 0
+    return info
+
+
+def max_real_id(paths, own_db: str | None = None, report=None) -> int:
+    """Highest REAL song id over one or several base dbs (json and/or xml).
+
+    Custom ids start one above it, which avoids both collisions and the
+    out-of-table write ids above 3071 trigger at boot (CLAUDE.md §4.1).
+    Several bases matter because the plugin's music_db.json lags behind a game
+    update until a WebUI asset update runs: for build 2026071400 it ended at
+    2384 while the game's data/others/music_db.xml reaches 2403, so ids taken
+    from the json alone handed out 2385 — a real song (fixed in 0.20.1
+    was released). `report`, if given, receives each base_db_ids() result."""
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+    best = 0
+    for p in paths:
+        info = base_db_ids(os.fspath(p), own_db)
+        if report is not None:
+            report(info)
+        best = max(best, info["max_id"])
+    return best
+
+
+def _max_existing_id(path: str) -> int:
+    """Highest real song id in ONE base music_db (json or xml). Kept for
+    callers written before max_real_id (the chart editor's vox_host, launcher
+    bridges older than 0.20.0)."""
+    return max_real_id([path])
 
 
 def main():
@@ -4244,10 +4445,13 @@ def main():
                     help="song id (single) or starting id (--batch). Omit when "
                          "using --base-db. Keep ids just above your real max, NOT "
                          "9001+ (very high ids overflow the game's song array).")
-    ap.add_argument("--base-db", default=None,
-                    help="path to your real music_db.json (in the plugin) or "
-                         "music_db.xml; auto-assigns ids starting just above the "
-                         "highest real song id (safe: no collision, no overflow)")
+    ap.add_argument("--base-db", action="append", default=None, metavar="DB",
+                    help="a real music_db: the plugin's music_db.json and/or the "
+                         "game's data/others/music_db.xml. Repeatable — ids start "
+                         "just above the highest real song id over ALL of them "
+                         "(custom/nautica songs and the converter's own merged db "
+                         "do not count). Give both: the plugin's json lags behind "
+                         "a game update until a WebUI asset update runs.")
     ap.add_argument("--out", default="./data_mods/nautica/music",
                     help="song output root (default ./data_mods/nautica/music)")
     ap.add_argument("--db", default=None,
@@ -4348,8 +4552,14 @@ def main():
         print("  0.19 camera : " + ("ok (spin types by kind/length, ksh/kson spin "
                                     "parsing, spin on the slam's first point, spin "
                                     "without a slam warned, Tilt block markers 2/0/3/1 "
-                                    "with hold rows)"
+                                    "with hold rows, 0-tick row for a jump inside a "
+                                    "block)"
                                     if not bad else "FAILED — " + "; ".join(bad)))
+        bad = _with_quiet_stdout(_check_ids)
+        print("  song ids    : " + ("ok (id floor over several --base-db, custom and "
+                                    "merged-db songs left out, unsafe remembered id "
+                                    "retired)" if not bad
+                                    else "FAILED — " + "; ".join(bad)))
         bad = _check_effects()
         print("  0.20 effects: " + ("ok (#POSTEFFECT stage/index/ms + typo fix, "
                                     "SPCONTROLER commands as 8 fields, dead commands "
@@ -4372,9 +4582,28 @@ def main():
     AUDIO_FORMAT = a.audio_format
     AUDIO_CHANNELS = 1 if a.audio_channels == "mono" else 2
 
+    if a.db is None:
+        merged = _default_merged_path(a.out)
+    elif a.db.lower() == "none":
+        merged = None
+    else:
+        merged = a.db
+
     if a.base_db:
-        start_id = _max_existing_id(a.base_db) + 1
-        print(f"[id] base-db max id {start_id - 1} → assigning custom ids from {start_id}")
+        for b in a.base_db:
+            if not os.path.isfile(b):
+                ap.error(f"--base-db {b}: no such file")
+
+        def show(info):
+            if info["ignored"]:
+                print(f"[id] base-db {info['path']}: ignored — {info['ignored']}")
+            else:
+                own = f", {info['own']} custom left out" if info["own"] else ""
+                print(f"[id] base-db {info['path']}: {info['songs']} real "
+                      f"song(s), max id {info['max_id']}{own}")
+        start_id = max_real_id(a.base_db, merged, report=show) + 1
+        print(f"[id] real songs reach {start_id - 1} → assigning custom ids "
+              f"from {start_id}")
     elif a.id is not None:
         start_id = a.id
     else:
@@ -4385,13 +4614,6 @@ def main():
                  f"above 3071 crash the game at boot. Pick lower ids; if --base-db "
                  f"reports a max near 3071 your db is nearly full and there's no safe "
                  f"room for custom songs.")
-
-    if a.db is None:
-        merged = _default_merged_path(a.out)
-    elif a.db.lower() == "none":
-        merged = None
-    else:
-        merged = a.db
 
     if a.batch:
         result = convert_batch(a.folder, start_id, a.out, merged, a.db_encoding,
@@ -4411,13 +4633,15 @@ def main():
                      "remember the id")
         imap = load_import_map(map_path)
         merged_ids = set(_read_existing_entries(merged)) if merged else None
-        if not a.force and is_up_to_date(imap, a.folder, a.out, merged_ids):
+        if not a.force and is_up_to_date(imap, a.folder, a.out, merged_ids,
+                                         floor_id=start_id):
             sid = imap["songs"][map_key(a.folder)]["id"]
             print(f"[skip] {map_key(a.folder)} (id {sid}) is unchanged and "
                   f"already converted with ksh2vox {__version__}. "
                   f"Use --force to convert it anyway.")
             return
-        sid, is_new = assign_song_id(imap, a.folder, start_id)
+        sid, is_new = assign_song_id(imap, a.folder, start_id, a.out, merged,
+                                     a.db_encoding)
         print(f"[id] {map_key(a.folder)} → "
               f"id {sid} ({'new' if is_new else 'from map'})")
         if convert_song(a.folder, sid, a.out, merged, a.db_encoding):

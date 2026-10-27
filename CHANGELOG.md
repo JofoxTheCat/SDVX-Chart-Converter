@@ -11,6 +11,59 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.20.1] - 2026-10-27
+
+Bug-fix release: two faults found right after v0.20.0 was published (the
+fixes were meant to go into 0.20.0 but the tag was already public). Output
+changes only for charts with a manual tilt that jumps inside one stretch
+(library: Aegleseeker MXM, one row) and for songs whose remembered id lies
+below the new id floor; the version bump re-converts every song once.
+
+### Fixed
+- **Song ids collided with real songs.** Ids start one above the highest real
+  song id of `--base-db`, and the documented base was the plugin's
+  `music_db.json`. That file is written by Asphyxia's WebUI asset update and
+  lags behind a game update: for game build 2026071400 it ends at 2384 (35
+  real songs missing) while the game's `data/others/music_db.xml` reaches
+  2403, so the first import got **2385 — a real song**. Now:
+  - `--base-db` is repeatable and the floor is the maximum over all bases
+    (`max_real_id(paths, own_db)` for importers; `base_db_ids()` reports per
+    file; `_max_existing_id(path)` stays for older callers). Custom songs never
+    count: nautica-tagged json entries as before, a `*.merged.xml` / the
+    converter's own merged db as a whole, and in any other xml (layeredfs's
+    `_cache/others/music_db.xml` holds real songs and ours merged) the entries
+    whose id and title match the own merged db.
+  - A remembered id below the floor was reassigned before, but only if the
+    song was not skipped as unchanged — `is_up_to_date` now takes `floor_id`
+    and refuses such an id. The old id is also retired at once: its entry
+    leaves `music_db.merged.xml` (layeredfs would lay it over the real song)
+    and its output folder `<old id>_<ascii>` is removed; before, both stayed.
+  - Verified on a scratch copy of the 24-chart library: json alone → ids
+    2385–2392 (the old result), json + the game's xml → 2404–2411; a library
+    imported at 2385–2392 re-run with both bases moves every song to
+    2404–2411 with a warning, leaves exactly those 8 entries in the merged db
+    and 8 folders, is byte-identical to a fresh import at 2404, and a further
+    run skips all 8. `--self-check` line "song ids".
+- **A manual tilt that jumps inside one stretch ramped instead.** kson
+  `[y, [1.0, -1.0]]` (or two ksh `tilt=` lines on one tick) became two chained
+  rows of one block with the value jumping between them. Under the Tilt
+  grammar read out of the DLL (each row adds a key at its time with its
+  *from* value, the block's last row also its end with *to*; durations in
+  between are ignored) the key 1.0 at the jump was lost and
+  the game ramped from the previous key into -1.0. The official encoding of an
+  instant change is a **0-tick row** `t 0 old new` followed by the next row at
+  the same tick from `new`: all 31 zero-duration Tilt rows of the official
+  charts (12 charts, 10 songs) change the value, 30 are followed that way, the
+  22 that do not open a block chain from the previous row's `to` (e.g. 0272
+  4i `002,04,00 Tilt 2 0 0.25 -0.25 0.00 0.00`, then `002,04,00 Tilt 2 48
+  -0.25 -0.25 0.00 0.00`). Two blocks touching at one tick with a different
+  value occur only twice (one chart), so the jump stays inside its block. The
+  last point of a stretch already had that row. Library: only Aegleseeker MXM
+  changes, by one row (`038,02,24 Tilt 2 0 -0.30 0.30 0.00 0.00`, the ksh
+  jump -0.3 → 0.3 at line 2370/2371); the other 23 chart files and all
+  audio, jackets and the db are byte-identical. `--self-check` line
+  "0.19 camera" has the case.
+
 ## [0.20.0] - 2026-10-27
 
 Game effects for "full creative freedom" in the SDVX Chart Editor — but only
