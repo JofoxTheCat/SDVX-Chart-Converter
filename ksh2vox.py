@@ -23,7 +23,27 @@ music_db.merged.xml.
 Only for legitimate use: your own or user-generated Nautica charts. Do not use it
 to extract or redistribute proprietary game data.
 """
-__version__ = "0.18.0"
+__version__ = "0.20.0"
+
+# 0.20.0 Game effects authored in the SDVX Chart Editor, written only with
+#        what the ∇ DLL reads (Ghidra RE 2026-10-27): #POSTEFFECT rows with
+#        stage / instance index / ms lengths (ChromaticAberration written
+#        correctly; the official typo is read as an alias), SPCONTROLER
+#        commands LaneY, BIL_RotZ, Morphing2, BAR, BAROFF and the SpecialN
+#        kinds the game consumes (8 fields per row; dead commands dropped and
+#        warned), #BPM OPTION, #SCRIPT_DEFINE / #SCRIPTED_TRACKn. ksh:
+#        `lane_toggle` → LaneY, `//#vox_…` comment lines, header `bg_no=`.
+#        Charts without these features convert byte-identically to 0.19.0.
+
+# 0.19.0 Camera, measured on all 8,602 official charts. Lane spins (ksh
+#        `@(`/`@)`/`@<`/`@>`/`S<`/`S>`, kson camera.cam.pattern.laser.
+#        slam_event) become laser field 4 on the slam's first point — spin
+#        2/3/1 by length, half spin and swing 5 (type meanings from the public
+#        converters; the data shows the id carries neither direction nor
+#        length). Tilt rows get their block marker in field 7 (2 first, 0
+#        middle, 3 last, 1 single — the grammar of 978 of 987 official tilt
+#        charts); a held manual tilt ends in a hold row instead of an instant
+#        reset. zoom_side / center_split / rotation_deg stay unrepresentable.
 
 # 0.18.0 Skill radar from the chart editor's fitted model (radar_model.py +
 #        radar_model.json): 85 time-based pattern features, per-axis linear
@@ -332,6 +352,7 @@ def convert_chart(ksh_path: str) -> dict:
         filter_events.append((0, _laser_filter_code(parsed, header["filtertype"],
                                                     filter_defs)))
     tilt_events = []
+    spins = []                     # (tick, kind, direction, length) — 0.19.0
     cam = {"zoom_top": [], "zoom_bottom": []}
     scroll, stops = [], []
     pending_width = [1, 1]         # laserrange_l/r=2x: widens the next section only
@@ -373,7 +394,9 @@ def convert_chart(ksh_path: str) -> dict:
             if mt and "-" not in ln:          # a ranged inline t= is no tempo either
                 bpm_events.append((tick + (li * ticks_in_measure // n), float(mt.group(1))))
             if not re.match(r"^[0-9\-:]{4}\|", ln):
-                if "=" in ln and not ln.startswith("//"):
+                if ln.startswith("//#vox_"):        # 0.20.0 editor effects
+                    _ksh_vox_comment(parsed, ln, tick + (li * ticks_in_measure // n))
+                elif "=" in ln and not ln.startswith("//"):
                     _ksh_option(parsed, ln, tick + (li * ticks_in_measure // n),
                                 fx_defs, filter_defs, fx_events, filter_events,
                                 tilt_events, cam, scroll, stops, pending_width)
@@ -409,9 +432,10 @@ def convert_chart(ksh_path: str) -> dict:
             # lane shows '-' (laser off); ':' keeps the current section open
             # without adding a control point. Without these boundaries every
             # lane would collapse into one endless laser.
-            if len(las) > 2 and re.search(r"[@S][()<>]", las[2:]):
-                _warn(parsed, "lane spins / swings are not converted to VOX "
-                              "yet — ignored")
+            if len(las) > 2:                # lane spin / half spin / swing
+                sp = _ksh_spin(las[2:])
+                if sp is not None:
+                    spins.append((t,) + sp)
             for k in range(2):
                 ch = las[k] if k < len(las) else "-"
                 v = _laser_val(ch)
@@ -502,11 +526,15 @@ def convert_chart(ksh_path: str) -> dict:
         "end": end_tick,
         "laser_meta": laser_meta,
         "tilt": tilt_events,
+        "spins": spins,
         "cam": cam,
         "scroll": scroll,
         "stops": stops,
         "radar_input": rin,
     })
+    parsed.pop("_lane_hidden", None)
+    _ksh_finish_vox(parsed)
+    _scripted_check(parsed)
     return parsed
 
 
@@ -651,6 +679,8 @@ def _ksh_option(parsed, line, t, fx_defs, filter_defs, fx_events,
             ln = 0
         if ln > 0:
             stops.append((t, ln))
+    elif key == "lane_toggle":
+        _lane_toggle(parsed, t, value)
     elif key in ("fx-l_se", "fx-r_se", "chokkakuse"):
         _warn(parsed, "custom chip / slam sounds cannot be represented in VOX "
                       "— the game's default sounds play")
@@ -879,6 +909,7 @@ def convert_kson(path: str) -> dict:
                         if _radar_model is not None else None),
     }
     _kson_extras(parsed, doc)
+    _scripted_check(parsed)
     if "bg_no" in parsed.get("vox_extras", {}):
         header["bg_no"] = str(parsed["vox_extras"]["bg_no"])
     return parsed
@@ -1403,18 +1434,62 @@ def _kson_tilt(entries, on_bad=None) -> list:
     return out
 
 
-def _tilt_emit(parsed: dict, events: list):
-    """→ (TILT MODE rows [(tick, mode)], Tilt SPCONTROLER tweens)."""
-    modes, tweens, manual = [(0, 0)], [], []
+# Tilt row field 7 (0.19.0) is a block marker. Measured on all 16,771 official
+# Tilt rows (987 charts): rows group into blocks that chain exactly (every row
+# inside a block starts where the previous one ends — 13,882 of 13,882 — and
+# continues its value), and field 7 marks the block: 2 = first row, 0 = middle,
+# 3 = last row, 1 = a block of one row. The grammar holds in 978 of 987 charts
+# without a single exception (one chart, 0706 kitasaitama EXH, has 89 middle
+# rows outside any block; 8 have one stray row or a block left open at the end).
+# Between blocks there is a gap in 1,811 of 1,902 cases, and the next block
+# starts from a different value in 533 — the game does not carry the value
+# over, i.e. outside a block the automatic tilt applies (the meaning is the
+# hypothesis; the grammar is measured). A held manual value is therefore a hold
+# row (from == to) that runs to the end of the block, never an open end: the
+# official 0061 retrospec INF holds 0.50 for 5168 ticks up to its end.
+TILT_SINGLE, TILT_START, TILT_MIDDLE, TILT_END = 1, 2, 0, 3
 
-    def flush(reset_at=None):
+
+def _tilt_blocks(tweens: list) -> list:
+    """[(tick, dur, from, to)] → [(tick, dur, from, to, flag)]. Consecutive
+    rows that chain (start = previous start + duration) form a block."""
+    rows = sorted(tweens, key=lambda r: r[0])
+    out, i = [], 0
+    while i < len(rows):
+        j = i
+        while j + 1 < len(rows) and rows[j + 1][0] == rows[j][0] + rows[j][1]:
+            j += 1
+        if i == j:
+            out.append(rows[i] + (TILT_SINGLE,))
+        else:
+            out.append(rows[i] + (TILT_START,))
+            out += [r + (TILT_MIDDLE,) for r in rows[i + 1:j]]
+            out.append(rows[j] + (TILT_END,))
+        i = j + 1
+    return out
+
+
+def _tilt_emit(parsed: dict, events: list):
+    """→ (TILT MODE rows [(tick, mode)], Tilt SPCONTROLER rows
+    [(tick, dur, from, to, block flag)])."""
+    modes, tweens, manual = [(0, 0)], [], []
+    end = parsed.get("end") or 0
+
+    def flush(until=None):
+        # A manual value holds until the next auto mode or the chart end: one
+        # hold row closes the block there (see the block marker above). Until
+        # 0.19.0 a 0-tick reset row (last → 0) stood at the auto mode instead,
+        # and a value held to the chart end had no row at all.
         for t, d, a, b in _graph_pieces(manual, 12):
+            if d == 0 and a == b:
+                continue                    # a lone point: the hold below says it
             tweens.append((t, d, _clamp_unit(parsed, a, "manual tilt"),
                            _clamp_unit(parsed, b, "manual tilt")))
-        if reset_at is not None:
-            last = _clamp_unit(parsed, manual[-1][2], "manual tilt")
-            if last != 0:
-                tweens.append((reset_at, 0, last, 0.0))
+        stop = end if until is None else until
+        last_t = manual[-1][0]
+        last = _clamp_unit(parsed, manual[-1][2], "manual tilt")
+        if stop > last_t:
+            tweens.append((last_t, stop - last_t, last, last))
 
     for ev in sorted(events, key=lambda e: e[0]):
         if ev[1] == "auto":
@@ -1436,6 +1511,7 @@ def _tilt_emit(parsed: dict, events: list):
             manual.append((ev[0], ev[2], ev[3], ev[4]))
     if manual:
         flush()
+    tweens = _tilt_blocks(tweens)
     rows, last = [], None
     by_tick = {}
     for t, m in modes:
@@ -1478,6 +1554,140 @@ def _cam_rows(parsed: dict) -> list:
             rows.append((t, name, d, _clamp_unit(parsed, a * k, key),
                          _clamp_unit(parsed, b * k, key)))
     return rows
+
+
+# ── lane spins → laser field 4 (0.19.0) ─────────────────────────────────────
+# Laser field 4 is the spin type, written on the FIRST point of a slam pair
+# (two points on one position). Measured over all 8,602 official charts:
+# 19,866 non-zero values, 99.5 % on the first point of a pair (19,768);
+# ids 1..7 occur (1: 9,232, 3: 4,617, 2: 3,194, 5: 2,272, 6: 395, 7: 122,
+# 4: 34). The id carries no direction — every id sits on left and right slams
+# about equally (1: 4,658 / 4,563, 5: 1,113 / 1,158, …), so the direction is
+# the slam's own. Nor a length: no id prefers a time signature (3/4 share
+# 3.7-4.7 % for 1, 2, 3 and 5 alike) — each type has its own fixed animation.
+#
+# Which type is which comes from the public converters, not from the data:
+#   id 1  normal spin, one measure — all three agree (VOX2KSH `@(192`,
+#         vox2ksh "MEASURE", VoxCharger "Measure" for every `@(`)
+#   id 2  short spin — VOX2KSH `@(48`, vox2ksh "HALF_MEASURE", VoxCharger
+#         "HalfMeasure"
+#   id 3  medium spin — VOX2KSH `@(96`, vox2ksh "THREE_BEAT", VoxCharger
+#         "ThreeBeat" (`@(` of length <= 144)
+#   id 4  long multi-turn spin — VOX2KSH `@(432` plus two extra turns of manual
+#         tilt, VoxCharger "TripleMeasure"; 34 rows in 33 official charts
+#   id 5  half spin — VOX2KSH `@<96`, vox2ksh `@<`; VoxCharger "Swing" (its
+#         ksh `S<` and short `@<`)
+#   id 6, 7  no converter knows them; both appear first with game version 6
+#         (EXCEED GEAR) and are not written.
+# All three order the spin durations the same way: 2 < 3 < 1 < 4. A ksh/kson
+# spin (one rotation, its length scaling the speed) therefore becomes 2, 3 or
+# 1 by length, with the boundaries at the geometric means of VOX2KSH's lengths
+# (48 | 68 | 96 | 136 | 192); 4 adds turns K-Shoot's spin does not have, so a
+# long spin stays 1. A half spin becomes 5; a swing too (VoxCharger, the only
+# converter that writes one) — a hypothesis, warned. In v13 charts the types
+# in use are 1 (710), 6 (132), 5 (131) and 7 (58); 2, 3 and 4 are older, but
+# the running game still plays them in thousands of official charts.
+SPIN_NOMINAL = {1: 192, 2: 48, 3: 96, 5: 96}     # ticks, VOX2KSH's reading
+
+
+def _spin_id(kind: str, length: int) -> tuple[int, bool]:
+    """(VOX spin type, approximate?) for a K-Shoot lane spin."""
+    if kind == "spin":
+        sid = 2 if length < 68 else (3 if length < 136 else 1)
+    else:                                   # half_spin, swing
+        sid = 5
+    nom = SPIN_NOMINAL[sid]
+    return sid, kind == "swing" or not (nom / 1.5 <= length <= nom * 1.5)
+
+
+def _ksh_spin(sfx: str):
+    """ksh lane suffix (`@(192`, `@>96`, `S<48;150;3;2`) → (kind, direction,
+    length in ticks) or None. `(`/`<` turn left (-1), `)`/`>` right (+1) — the
+    chart editor's KshReader reads them the same way."""
+    if len(sfx) < 3 or sfx[0] not in "@S" or sfx[1] not in "()<>":
+        return None
+    try:
+        length = int(sfx[2:].split(";")[0])
+    except ValueError:
+        return None
+    kind = "swing" if sfx[0] == "S" else ("spin" if sfx[1] in "()" else "half_spin")
+    return kind, (-1 if sfx[1] in "(<" else 1), length
+
+
+def _kson_spins(node, on_bad=None) -> list:
+    """kson camera.cam.pattern.laser.slam_event → [(tick, kind, dir, length)].
+    Entries are [y, d, length(, swing params)]; malformed ones are skipped."""
+    out = []
+    for kind in ("spin", "half_spin", "swing"):
+        for e in _seq(_obj(node).get(kind)):
+            try:
+                if isinstance(e, dict):
+                    y, d, ln = e.get("y"), e.get("d", 1), e.get("l", e.get("length", 0))
+                else:
+                    y, d, ln = e[0], (e[1] if len(e) > 1 else 1), (e[2] if len(e) > 2 else 0)
+                for x in (y, d, ln):
+                    if isinstance(x, bool) or not isinstance(x, (int, float)) \
+                            or not math.isfinite(x):
+                        raise ValueError(x)
+            except _BAD_DATA:
+                if on_bad:
+                    on_bad()
+                continue
+            out.append((_kson_tick(y), kind, -1 if d < 0 else 1, _kson_tick(ln)))
+    return out
+
+
+def _slam_dirs(sections, infer_slams: bool) -> dict:
+    """{tick: direction} of the slams of one laser lane, as _laser_track will
+    emit them (+1 = value rises = to the right)."""
+    out = {}
+    for sec in sections:
+        if len(sec) < 2:
+            continue
+        pts = _collapse_slams(sec) if infer_slams else sec
+        for (t, v), (t2, v2) in zip(pts, pts[1:]):
+            if t == t2 and v != v2:
+                out.setdefault(t, 1 if v2 > v else -1)
+    return out
+
+
+def _spin_fields(parsed: dict, infer_slams: bool) -> list:
+    """Per laser lane {tick: spin type} for laser field 4 (0.19.0).
+
+    A spin needs a slam at its position — VOX has no other place for it. The
+    lane whose slam turns the spin's way is used (left lane first when both
+    do: one row, like 99.5 % of the official spins); a slam the other way still
+    takes it, the VOX direction being the slam's. One warning per kind of loss."""
+    spins = parsed.get("spins") or []
+    lanes = [{}, {}]
+    if not spins:
+        return lanes
+    dirs = [_slam_dirs(parsed["laser"][k], infer_slams) for k in range(2)]
+    approx, flipped, lost = [], 0, 0
+    for t, kind, d, length in sorted(spins, key=lambda s: s[0]):
+        cand = [k for k in range(2) if t in dirs[k] and t not in lanes[k]]
+        if not cand:
+            lost += 1
+            continue
+        same = [k for k in cand if dirs[k][t] == d]
+        k = (same or cand)[0]
+        if not same:
+            flipped += 1
+        sid, rough = _spin_id(kind, length)
+        lanes[k][t] = sid
+        if rough:
+            approx.append(f"{kind} {length}→{sid}")
+    if lost:
+        _warn(parsed, f"{lost} lane spin(s) without a slam at their position "
+                      f"dropped — VOX ties a spin to a slam")
+    if flipped:
+        _warn(parsed, f"{flipped} lane spin(s) turn against their slam — VOX "
+                      f"spins follow the slam's direction")
+    if approx:
+        _warn(parsed, "lane spins approximated by the nearest VOX spin type "
+                      "(fixed lengths; swing parameters are not representable): "
+                      + ", ".join(sorted(set(approx))))
+    return lanes
 
 
 # ── scroll speed and stops ───────────────────────────────────────────────────
@@ -1605,9 +1815,21 @@ def _editor_vox_extras(parsed: dict, doc: dict) -> dict:
     pe = []
     for r in rows("post_effect", "#POSTEFFECT"):
         try:
-            y, name, param, a, b, ln = _seq(r)[:6]
-            pe.append((pulse(y), clean(name), clean(param), _fnum(a), _fnum(b),
-                       max(0, pulse(ln))))
+            r = _seq(r)
+            y, name, param, a, b, ln = r[:6]
+            # 0.20.0: optional stage, instance index and a length in ms
+            # (null = the pulse length) — rows written before stay stage 0 / 0.
+            stage = _pe_int(r[6]) if len(r) > 6 else 0
+            index = _pe_int(r[7]) if len(r) > 7 else 0
+            ms = r[8] if len(r) > 8 else None
+            if ms is not None:
+                ms = _fnum(ms, -1.0)
+                if not 0 <= ms <= 600000:
+                    raise ValueError(ms)
+            row = _pe_row(parsed, pulse(y), clean(name), clean(param), _fnum(a),
+                          _fnum(b), max(0, pulse(ln)), stage, index, ms)
+            if row:
+                pe.append(row)
         except _BAD_DATA:
             _warn(parsed, "an editor #POSTEFFECT row is malformed and was skipped")
     if pe:
@@ -1625,7 +1847,393 @@ def _editor_vox_extras(parsed: dict, doc: dict) -> dict:
             _warn(parsed, "an editor #SPCONTROLER row is malformed and was skipped")
     if sp:
         out["sp_controller"] = sp
+    # 0.20.0: game commands, #BPM OPTION and note scripts (docs: the chart
+    # editor's docs/VOX_EFFECTS.md). Malformed entries warn and are skipped.
+    cmds = []
+    for r in rows("commands", "SPCONTROLER command"):
+        try:
+            r = _seq(r)
+            y, name, typ, ln = r[:4]
+            if isinstance(typ, bool) or not isinstance(typ, (int, float)):
+                raise ValueError(typ)
+            ps = [x if isinstance(x, str) else _vox_num_token(x)
+                  for x in (list(r[4:8]) + ["0", "0", "0", "0"])[:4]]
+            row = _sp_command(parsed, pulse(y), clean(name), int(typ),
+                              max(0, pulse(ln)), ps)
+            if row:
+                cmds.append(row)
+        except _BAD_DATA:
+            _warn(parsed, "an editor SPCONTROLER command is malformed and was skipped")
+    if cmds:
+        out["commands"] = cmds
+    bopt = ours.get("bpm_option")
+    if bopt is not None:
+        opts = _bpm_options(parsed, _obj(bopt).items() if isinstance(bopt, dict) else [])
+        if not isinstance(bopt, dict):
+            _warn(parsed, "editor #BPM OPTION data is not an object — ignored")
+        if opts:
+            out["bpm_option"] = opts
+    scripts = {}
+    for r in rows("scripts", "#SCRIPT_DEFINE"):
+        try:
+            r = _seq(r)
+            sid = _pe_int(r[0], 0, 2 ** 31 - 1)
+            body = [s for s in _seq(r[1]) if isinstance(s, str)]
+            if len(body) != len(_seq(r[1])):
+                raise ValueError(r[1])
+            _add_script(parsed, scripts, sid, body)
+        except _BAD_DATA:
+            _warn(parsed, "an editor note script is malformed and was skipped")
+    if scripts:
+        out["scripts"] = scripts
+    scripted = []
+    for r in rows("scripted", "#SCRIPTED_TRACK"):
+        try:
+            r = _seq(r)
+            ids = [_pe_int(i, 0, 2 ** 31 - 1) for i in _seq(r[2])]
+            if not ids:
+                raise ValueError(r)
+            scripted.append((pulse(r[0]), _pe_int(r[1], 1, 8), ids))
+        except _BAD_DATA:
+            _warn(parsed, "an editor scripted note is malformed and was skipped")
+    if scripted:
+        out["scripted"] = scripted
     return out
+
+
+# ── VOX effects authored in the chart editor (0.20.0) ────────────────────────
+# What the ∇ DLL actually reads (Ghidra, 2026-10-27; notes in the toolchain's
+# CLAUDE.md §6 "What the ∇ DLL actually reads"): #POSTEFFECT rows (9 fields),
+# the SPCONTROLER commands LaneY / BIL_RotZ / Morphing2 / BAR / BAROFF and a
+# subset of SpecialN kinds, #BPM OPTION, #SCRIPT_DEFINE / #SCRIPTED_TRACKn.
+# Commands the game parses but never reads (LaneX, GEO_RotZ/RotX, Tilt_Mag,
+# 3D_Scroll, Morphing0/1/3, LANEMODEL*, LANEDISP, HudY, AIRL/AIRR_ScaX …) are
+# dropped with a warning: written, they would do nothing.
+PE_EFFECTS = ("ChromaticAberration", "ColorConversion", "RadicalBlur",
+              "SimpleNoise", "CrtMonitorEffect", "LuminousEffect",
+              "SetFrameLabel", "RandomShake")
+PE_ALIASES = {"ChromaticAbberation": "ChromaticAberration"}  # official typo
+PE_MAX_STAGE = 15
+SP_COMMANDS = ("LaneY", "BIL_RotZ", "Morphing2", "BAROFF", "BAR", "SpecialN")
+SP_SPECIAL_KINDS = ("LANECOL", "LANECLEARCOL", "FRAME", "SE", "SE2", "LIVE2D",
+                    "NEMSYS", "SIDEBG", "EXMC_LABEL", "EXMC_PARAM",
+                    "RENDER_PRESET", "DISABLE_PRE_EFFECT_LINE", "EXBG",
+                    "EXBGTEX")
+SP_DEAD = ("LaneX", "GEO_RotZ", "GEO_RotX", "Tilt_Mag", "3D_Scroll",
+           "Morphing0", "Morphing1", "Morphing3", "HudY", "AIRL_ScaX",
+           "AIRR_ScaX", "AIRL_PosX", "AIRR_PosX", "CAM_PosY", "CAM_PosZ",
+           "CAM_rotX", "SpecialF", "BgSpeed", "BGROT", "3DBG_PosZ",
+           "3DBG_RotZ", "3DBG_Speed", "EXBG_RotZ", "EXBG_Scale", "EXBG_PosX",
+           "EXBG_PosY", "EXBG2_PosX", "EXBG2_PosY", "EXBG3_PosX",
+           "EXBG3_PosY", "3DNotes", "2DNotes")
+SP_DEAD_KINDS = ("LANEMODEL0", "LANEMODEL1", "LANEMODEL2", "LANEMODEL3",
+                 "LANEDISP", "SIDE", "ADJRVZ", "EXBGROTF", "EFFECTL_PAGE",
+                 "EFFECTR_PAGE", "BGDISP", "EFFECTL_JLINE", "EFFECTR_JLINE",
+                 "BIL_H", "EXBG_Frame", "EXBG_Speed", "3DBG_Blend", "4ObjMode")
+BPM_OPTIONS = ("RepresentativeBpm", "ConstantScroll")
+# One VOX field: the parser splits rows on whitespace, so a token must not
+# hold any; prefixes f/i/x/d and table names (ON, LANECOL, se_08_big008 …).
+_VOX_TOKEN = re.compile(r"^[A-Za-z0-9_.+\-]{1,64}$")
+SCRIPT_VARS = ("$targetStep", "$offsetX", "$offsetY")
+_SCRIPT_TOKEN = re.compile(
+    r"\s*(\$targetStep|\$offsetX|\$offsetY|\$currentStep|when|"
+    r"[0-9]+(?:\.[0-9]*)?f?|\.[0-9]+f?|==|!=|<=|>=|[<>()+\-*/=])")
+
+
+def _pe_int(x, lo=0, hi=PE_MAX_STAGE) -> int:
+    if isinstance(x, bool) or not isinstance(x, (int, float)) \
+            or not math.isfinite(x) or x != int(x) or not lo <= x <= hi:
+        raise ValueError(x)
+    return int(x)
+
+
+def _vox_num_token(x) -> str:
+    """A bare number as a VOX field (kson numbers in a command row)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+        raise ValueError(x)
+    return _fixed(float(x), 2)
+
+
+def _pe_row(parsed, t, name, param, a, b, ln, stage=0, index=0, ms=None):
+    """A validated #POSTEFFECT row tuple, or None (warned)."""
+    name = PE_ALIASES.get(name, name)
+    if name not in PE_EFFECTS:
+        # the game maps an unknown name to ChromaticAberration (id 0)
+        _warn(parsed, f"unknown post effect '{name}' — row dropped")
+        return None
+    if not _VOX_TOKEN.match(param):
+        _warn(parsed, f"post effect parameter '{param}' is not one VOX field — row dropped")
+        return None
+    return (t, name, param, a, b, ln, stage, index, ms)
+
+
+def _sp_command(parsed, t, name, typ, ln, ps):
+    """A validated SPCONTROLER command tuple (t, name, type, len, [p1..p4]),
+    or None (warned). Only commands the game reads pass."""
+    if name in SP_DEAD:
+        _warn(parsed, f"SPCONTROLER '{name}' is never read by the game — dropped")
+        return None
+    if name not in SP_COMMANDS:
+        _warn(parsed, f"unknown SPCONTROLER command '{name}' — dropped")
+        return None
+    if not 0 <= typ <= 0xFFFFFFFF:
+        _warn(parsed, f"SPCONTROLER '{name}' type {typ} out of range — dropped")
+        return None
+    ps = [str(p).strip() or "0" for p in ps]
+    if not all(_VOX_TOKEN.match(p) for p in ps):
+        _warn(parsed, f"an SPCONTROLER '{name}' value is not one VOX field — row dropped")
+        return None
+    if name == "SpecialN":
+        if ps[0] in SP_DEAD_KINDS:
+            _warn(parsed, f"SpecialN '{ps[0]}' is never read by the game — dropped")
+            return None
+        if ps[0] not in SP_SPECIAL_KINDS:
+            _warn(parsed, f"unknown SpecialN kind '{ps[0]}' — dropped")
+            return None
+    if name == "BAROFF" and ps[0] not in ("ON", "OFF"):
+        _warn(parsed, "BAROFF needs ON or OFF — row dropped")
+        return None
+    return (t, name, typ, ln, ps)
+
+
+def _bpm_options(parsed, items) -> dict:
+    opts = {}
+    for k, v in items:
+        if k == "RepresentativeBpm":
+            f = _fnum(v, -1.0)
+            if 0 < f <= 10000 and not isinstance(v, bool):
+                opts[k] = f
+            else:
+                _warn(parsed, "RepresentativeBpm must be a tempo > 0 — ignored")
+        elif k == "ConstantScroll":
+            if isinstance(v, bool) or v in (0, 1, "0", "1"):
+                opts[k] = 1 if v in (True, 1, "1") else 0
+            else:
+                _warn(parsed, "ConstantScroll must be 0 or 1 — ignored")
+        else:
+            _warn(parsed, f"unknown #BPM OPTION '{k}' — ignored")
+    return opts
+
+
+def script_errors(line: str) -> str | None:
+    """None when `line` is one statement the game's script parser accepts
+    (`<var> = <expr> [when <a> <op> <b>]`), else the reason. The grammar is
+    the one the official scripts use (1751, 2330); the DLL's expression
+    parser itself was not read, so this stays deliberately strict."""
+    s = line.strip()
+    pos, toks = 0, []
+    while pos < len(s):
+        m = _SCRIPT_TOKEN.match(s, pos)
+        if not m or m.end() == pos:
+            return f"unexpected '{s[pos:].strip()[:12]}'"
+        toks.append(m.group(1))
+        pos = m.end()
+        while pos < len(s) and s[pos].isspace():
+            pos += 1
+    if len(toks) < 3 or toks[0] not in SCRIPT_VARS or toks[1] != "=":
+        return "a statement starts with $targetStep, $offsetX or $offsetY and '='"
+    rest = toks[2:]
+    if rest.count("when") > 1:
+        return "only one 'when'"
+    expr, cond = (rest[:rest.index("when")], rest[rest.index("when") + 1:]) \
+        if "when" in rest else (rest, None)
+
+    def expr_ok(ts):
+        depth, want_value = 0, True
+        for x in ts:
+            if x == "(":
+                if not want_value:
+                    return False
+                depth += 1
+            elif x == ")":
+                if want_value or depth == 0:
+                    return False
+                depth -= 1
+            elif x in "+-*/":
+                if want_value and x != "-":
+                    return False
+                want_value = True
+            elif x.startswith("$") or x[0].isdigit() or x[0] == ".":
+                if not want_value:
+                    return False
+                want_value = False
+            else:
+                return False
+        return depth == 0 and not want_value
+
+    if not expr_ok(expr):
+        return "the value is not an arithmetic expression"
+    if cond is not None:
+        ops = [i for i, x in enumerate(cond) if x in ("==", "!=", "<", "<=", ">", ">=")]
+        if len(ops) != 1 or not expr_ok(cond[:ops[0]]) or not expr_ok(cond[ops[0] + 1:]):
+            return "'when' needs one comparison (== != < <= > >=)"
+    return None
+
+
+def _add_script(parsed, scripts: dict, sid: int, body: list) -> None:
+    lines = [ln.strip() for ln in body if ln.strip()]
+    for ln in lines:
+        err = script_errors(ln)
+        if err or re.search(r"[\r\n]", ln):
+            _warn(parsed, f"note script {sid}: '{ln[:40]}' — {err or 'line break'}; "
+                          f"script dropped")
+            return
+    if lines:
+        scripts[sid] = lines
+
+
+def _ksh_vox_comment(parsed, line: str, t: int) -> None:
+    """A `//#vox_…|…` comment line of a .ksh body (0.20.0, written by the
+    chart editor; KSM skips `//` lines). Position = the line's tick."""
+    tag, _, rest = line[3:].partition("|")
+    ex = parsed.setdefault("vox_extras", {})
+    try:
+        if tag == "vox_pe":
+            stage, index, ln, name, param, a, b = rest.split("|")
+            ms = None
+            if ln.endswith("ms"):
+                ms = float(ln[:-2])
+                if not (math.isfinite(ms) and 0 <= ms <= 600000):
+                    raise ValueError(ln)
+                ln = "0"
+            row = _pe_row(parsed, t, name.strip(), param.strip(), _fnum(a), _fnum(b),
+                          max(0, int(ln)), _pe_int(int(stage)), _pe_int(int(index)), ms)
+            if row:
+                ex.setdefault("post_effect", []).append(row)
+        elif tag == "vox_sp":
+            name, typ, ln, p1, p2, p3, p4 = rest.split("|")
+            row = _sp_command(parsed, t, name.strip(), int(typ), max(0, int(ln)),
+                              [p1, p2, p3, p4])
+            if row:
+                ex.setdefault("commands", []).append(row)
+        elif tag == "vox_bpm":
+            k, v = rest.split("|")
+            ex.setdefault("bpm_option", {}).update(
+                _bpm_options(parsed, [(k.strip(), v.strip())]))
+        elif tag == "vox_script":
+            sid, stmt = rest.split("|", 1)
+            body = parsed.setdefault("_ksh_scripts", {}).setdefault(
+                _pe_int(int(sid), 0, 2 ** 31 - 1), [])
+            body.append(stmt)
+        elif tag == "vox_scripted":
+            track, ids = rest.split("|")
+            ex.setdefault("scripted", []).append(
+                (t, _pe_int(int(track), 1, 8),
+                 [_pe_int(int(i), 0, 2 ** 31 - 1) for i in ids.split(",")]))
+        else:
+            _warn(parsed, f"unknown editor comment '//#{tag}' ignored")
+    except _BAD_DATA:
+        _warn(parsed, f"a //#{tag} line is malformed and was skipped")
+
+
+def _ksh_finish_vox(parsed) -> None:
+    """Scripts collected line by line from a .ksh, validated as a whole."""
+    raw = parsed.pop("_ksh_scripts", None)
+    if raw:
+        scripts = {}
+        for sid, body in raw.items():
+            _add_script(parsed, scripts, sid, body)
+        if scripts:
+            parsed.setdefault("vox_extras", {})["scripts"] = scripts
+
+
+def _lane_toggle(parsed, t: int, value: str) -> None:
+    """ksh `lane_toggle=<len>` (len in 1/192 of a measure): alternately hides
+    and shows the lane — VOX LaneY 0 → 1024 / 1024 → 0 (official rows, e.g.
+    0791 `LaneY 2 240 0.00 1024.00`; VoxCharger and VOX2KSH map it the same)."""
+    try:
+        ln = max(0, int(float(value)))
+    except ValueError:
+        _warn(parsed, f"lane_toggle '{value}' is not a length — ignored")
+        return
+    state = parsed.setdefault("_lane_hidden", [False])
+    hide = state[0] = not state[0]
+    a, b = ("0.00", "1024.00") if hide else ("1024.00", "0.00")
+    parsed.setdefault("vox_extras", {}).setdefault("commands", []).append(
+        (t, "LaneY", 2, ln, [a, b, "0.00", "0.00"]))
+
+
+def _scripted_check(parsed) -> None:
+    """A scripted entry attaches to the note starting exactly there on that
+    track (TRACK1 laser L, 2 FX-L, 3..6 BT, 7 FX-R, 8 laser R); a script id
+    must be defined. Anything else is dropped with a warning."""
+    ex = parsed.get("vox_extras") or {}
+    rows = ex.get("scripted")
+    if not rows:
+        return
+    scripts = ex.get("scripts") or {}
+    starts = {1: {s[0][0] for s in parsed["laser"][0] if s},
+              8: {s[0][0] for s in parsed["laser"][1] if s},
+              2: {e[0] for e in parsed["fx"][0]}, 7: {e[0] for e in parsed["fx"][1]}}
+    for k in range(4):
+        starts[3 + k] = {e[0] for e in parsed["bt"][k]}
+    keep = []
+    for t, track, ids in rows:
+        if t not in starts[track]:
+            _warn(parsed, f"a scripted note on TRACK{track} has no note at its "
+                          f"position — dropped")
+            continue
+        ids = [i for i in ids if i in scripts]
+        if not ids:
+            _warn(parsed, "a scripted note names no defined script — dropped")
+            continue
+        keep.append((t, track, ids))
+    ex["scripted"] = keep
+
+
+def _fmt_ms(ms: float) -> str:
+    s = _fixed(ms, 3).rstrip("0").rstrip(".")
+    return (s or "0") + "ms"
+
+
+def _posteffect_rows(rows, pos) -> str:
+    """#POSTEFFECT body: `pos type len Effect stage index Param from to`.
+    `type` is parsed but never read (official rows: 2, or 0); a length is
+    ticks or `<n>ms`; an instant row is `0`."""
+    out = []
+    for r in sorted(rows, key=lambda r: r[0]):
+        t, name, param, a, b, ln = r[:6]
+        stage, index, ms = (r[6], r[7], r[8]) if len(r) > 6 else (0, 0, None)
+        length = _fmt_ms(ms) if ms is not None else str(ln)
+        out.append(f"{pos(t)}\t2\t{length}\t{name}\t{stage}\t{index}\t"
+                   f"{param}\t{_fmt_pe(a)}\t{_fmt_pe(b)}")
+    return "\n".join(out)
+
+
+def _command_rows(cmds, pos) -> list:
+    """SPCONTROLER command rows `pos Name type dur p1 p2 p3 p4` (exactly the
+    8 fields the parser needs), grouped by name in first-use order, each group
+    sorted by time like official files."""
+    order = []
+    for c in cmds:
+        if c[1] not in order:
+            order.append(c[1])
+    lines = []
+    for name in order:
+        for t, n, typ, ln, ps in sorted((c for c in cmds if c[1] == name),
+                                        key=lambda c: c[0]):
+            lines.append(f"{pos(t)}\t{n}\t{typ}\t{ln}\t" + "\t".join(ps))
+    return lines
+
+
+def _script_sections(ex: dict, pos) -> str:
+    """#SCRIPT_DEFINE + #SCRIPTED_TRACKn sections (appended after the last
+    template section, the order of the official files)."""
+    scripts, scripted = ex.get("scripts") or {}, ex.get("scripted") or []
+    if not scripts or not scripted:
+        return ""
+    used = sorted({i for _, _, ids in scripted for i in ids})
+    out = ["#SCRIPT_DEFINE"]
+    for sid in used:
+        out += [f"@SCRIPTSTART {sid}"] + scripts[sid] + ["@SCRIPTEND", ""]
+    out.append("#END")
+    for track in range(1, 9):
+        rows = sorted((t, ids) for t, tr, ids in scripted if tr == track)
+        if rows:
+            out += ["", f"#SCRIPTED_TRACK{track}"]
+            out += [f"{pos(t)}\t" + "\t".join(str(i) for i in ids) for t, ids in rows]
+            out.append("#END")
+    return "\n".join(out)
 
 
 def _kson_extras(parsed: dict, doc: dict) -> None:
@@ -1746,8 +2354,8 @@ def _kson_extras(parsed: dict, doc: dict) -> None:
             g = [x for v in g.values() for x in _seq(v)]
         if any(p[1] or p[2] for p in graph(g, f"camera {key}")):
             _warn(parsed, f"camera '{key}' has no VOX counterpart — ignored")
-    if camcam.get("pattern"):
-        _warn(parsed, "lane spins / swings are not converted to VOX yet — ignored")
+    se = _obj(_obj(_obj(camcam.get("pattern")).get("laser")).get("slam_event"))
+    parsed["spins"] = _kson_spins(se, lambda: bad("lane spin"))
 
     # scroll speed and stops
     parsed["scroll"] = graph(beat.get("scroll_speed"), "scroll speed")
@@ -1914,6 +2522,52 @@ def _check_positions() -> list[str]:
             if pos(t) != want]
 
 
+def _check_camera() -> list[str]:
+    """0.19.0 lane spins and Tilt block markers, run by --self-check."""
+    bad = []
+    got = [_spin_id(k, n)[0] for k, n in (("spin", 24), ("spin", 48), ("spin", 67),
+                                          ("spin", 68), ("spin", 96), ("spin", 135),
+                                          ("spin", 136), ("spin", 192), ("spin", 576),
+                                          ("half_spin", 96), ("swing", 96))]
+    if got != [2, 2, 2, 3, 3, 3, 1, 1, 1, 5, 5]:
+        bad.append(f"spin types {got}")
+    if (_ksh_spin("@(192"), _ksh_spin("@>96"), _ksh_spin("S<48;150;3;2"), _ksh_spin("@x1")) \
+            != (("spin", -1, 192), ("half_spin", 1, 96), ("swing", -1, 48), None):
+        bad.append("ksh spin suffix")
+    if _kson_spins({"spin": [[960, -1, 960], "x"], "swing": [[1920, 1, 480, {}]]}) \
+            != [(192, "spin", -1, 192), (384, "swing", 1, 96)]:
+        bad.append("kson slam_event")
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        k = os.path.join(d, "s.ksh")
+        # lane L: slam 0 → 50 at line 0 (spin right), lane R: a spin with no slam
+        with open(k, "w", encoding="utf-8") as fh:
+            fh.write("title=t\nt=120\n--\n" + "0000|00|0-@)192\n" + "0000|00|o-\n"
+                     + "0000|00|::\n" * 6 + "0000|00|o-\n" + "0000|00|--\n" * 23
+                     + "--\n0000|00|-0@(96\n0000|00|-0\n--\n")
+        p = convert_chart(k)
+        vox = emit_vox(p).replace("\r\n", "\n")
+    rows = [r.split("\t") for r in (_section_body(vox, "TRACK1") or "").strip("\n").split("\n")]
+    spin_rows = [(r[0], r[3]) for r in rows if len(r) == 10 and r[3] != "0"]
+    if spin_rows != [("001,01,00", "1")] or rows[1][3] != "0":
+        bad.append(f"spin on the slam's first point {spin_rows}")
+    if not any("without a slam" in w for w in p["warnings"]):
+        bad.append("spin without a slam not warned")
+    # Tilt blocks: two points + auto later → 2 / 3 with a hold to the auto
+    # mode; a lone manual point held to the chart end → 1.
+    q = {"end": 192 * 4, "warnings": []}
+    _, tw = _tilt_emit(q, [(0, "manual", 0.0, 0.0, None), (48, "manual", 0.5, 0.5, None),
+                          (192, "auto", "normal"), (384, "manual", -0.5, -0.5, None)])
+    if tw != [(0, 48, 0.0, 0.5, TILT_START), (48, 144, 0.5, 0.5, TILT_END),
+              (384, 384, -0.5, -0.5, TILT_SINGLE)]:
+        bad.append(f"tilt blocks {tw}")
+    _, tw = _tilt_emit(q, [(0, "manual", 0.2, 0.2, None), (48, "manual", 0.4, 0.4, None),
+                          (96, "manual", 0.0, 0.0, None)])
+    if [r[4] for r in tw] != [TILT_START, TILT_MIDDLE, TILT_END] or tw[-1][:2] != (96, 672):
+        bad.append(f"tilt block middle {tw}")
+    return bad
+
+
 def _check_extras() -> list[str]:
     """0.17.0 mappings, run by --self-check. Returns the mismatches."""
     bad = []
@@ -2000,6 +2654,107 @@ def _check_extras() -> list[str]:
     return bad
 
 
+def _check_effects() -> list[str]:
+    """0.20.0 game effects, run by --self-check. Returns the mismatches."""
+    import tempfile
+    bad = []
+    official = [
+        "$targetStep = $currentStep + 48000 when ( $targetStep - $currentStep ) > 96",
+        "$offsetX = $offsetX + 5.0f * ( $targetStep - $currentStep - 48 ) / 48 "
+        "when ( $targetStep - $currentStep ) > 48",
+        "$targetStep = $targetStep - ( 48 * 2.5 ) when $currentStep < ( 48 * 4 * 25 + 48 * 1.5 )",
+        "$targetStep = ( $targetStep - $currentStep ) * 0.5f + $currentStep",
+        "$targetStep =  ( $targetStep - 54466 ) + 23808 + 48 * 8 - 6 when $currentStep <= 23808",
+    ]
+    if any(script_errors(s) for s in official):
+        bad.append("official script rejected: " + "; ".join(
+            str(script_errors(s)) for s in official if script_errors(s)))
+    if not all(script_errors(s) for s in ("$currentStep = 1", "$offsetX = 1 +",
+                                          "$offsetX = 1 when 2", "#END", "$offsetY = (1")):
+        bad.append("bad script accepted")
+    doc = {"version": "0.8.0", "meta": {"title": "t", "level": 1},
+           "beat": {"bpm": [[0, 120]]},
+           "note": {"bt": [[960], [], [], []], "fx": [[], []], "laser": [[], []]},
+           "impl": {"sdvx-editor": {"vox": {
+               "bg_no": 105,
+               "post_effect": [[960, "ColorConversion", "Mode", 2, 2, 0, 1, 0],
+                               [960, "ColorConversion", "Strength", 0, 100, 480, 1, 0],
+                               [1920, "ChromaticAbberation", "Strength", 0.02, 0, 0, 0, 1, 500],
+                               [1920, "Nonsense", "Strength", 0, 1, 0]],
+               "commands": [[960, "LaneY", 2, 240, "0", "1024", "0", "0"],
+                            [1920, "BIL_RotZ", 2, 480, "d0", "d-45", "0", "0"],
+                            [960, "SpecialN", 0, 0, "LANECOL", "xFFFF0000", "i0", "i0"],
+                            [0, "BAROFF", 0, 0, "ON", "0", "0", "0"],
+                            [0, "LaneX", 2, 0, "0", "1", "0", "0"],
+                            [0, "SpecialN", 0, 0, "LANEDISP", "0", "0", "0"],
+                            [0, "LaneY", 2, 0, "0 1", "0", "0", "0"]],
+               "bpm_option": {"RepresentativeBpm": 174, "ConstantScroll": True},
+               "scripts": [[7, ["$offsetX = $offsetX + 0.178 when ( $targetStep - $currentStep ) > 48"]],
+                           [8, ["$bogus = 1"]]],
+               "scripted": [[960, 3, [7]], [480, 3, [7]], [960, 4, [8]]]}}}}
+    with tempfile.TemporaryDirectory() as d:
+        k = os.path.join(d, "fx.kson")
+        with open(k, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        p = convert_kson(k)
+        v = emit_vox(p).replace("\r\n", "\n")
+        want_pe = ["002,01,00\t2\t0\tColorConversion\t1\t0\tMode\t2.0f\t2.0f",
+                   "002,01,00\t2\t96\tColorConversion\t1\t0\tStrength\t0.0f\t100.0f",
+                   "003,01,00\t2\t500ms\tChromaticAberration\t0\t1\tStrength\t0.02f\t0.0f"]
+        pe = (_section_body(v, "POSTEFFECT") or "").strip("\n").split("\n")
+        if pe != want_pe:
+            bad.append(f"POSTEFFECT rows {pe}")
+        sp = (_section_body(v, "SPCONTROLER") or "")
+        for row in ("002,01,00\tLaneY\t2\t48\t0\t1024\t0\t0",
+                    "003,01,00\tBIL_RotZ\t2\t96\td0\td-45\t0\t0",
+                    "002,01,00\tSpecialN\t0\t0\tLANECOL\txFFFF0000\ti0\ti0",
+                    "001,01,00\tBAROFF\t0\t0\tON\t0\t0\t0",
+                    "001,01,00\tRealize\t3\t0\t17.12\t60.12\t110.12\t0.00"):
+            if row not in sp:
+                bad.append(f"SPCONTROLER row missing: {row!r}")
+        if "LaneX" in sp or "LANEDISP" in sp or "0 1" in sp:
+            bad.append("dead / malformed command written")
+        if any(len(r.split()) != 8 for r in sp.strip("\n").split("\n")):
+            bad.append("an SPCONTROLER row is not 8 fields")
+        if "#BPM OPTION\nRepresentativeBpm\t174.0000\nConstantScroll\t1\n#END" not in v \
+                or v.find("#BPM OPTION") < v.find("#BPM INFO"):
+            bad.append("BPM OPTION section")
+        if "#SCRIPT_DEFINE\n@SCRIPTSTART 7\n$offsetX = $offsetX + 0.178 when" not in v \
+                or "#SCRIPTED_TRACK3\n002,01,00\t7\n#END" not in v \
+                or "SCRIPTED_TRACK4" in v or "@SCRIPTSTART 8" in v:
+            bad.append("script sections")
+        if p["header"].get("bg_no") != "105":
+            bad.append("kson bg_no")
+        if not any("never read" in w for w in p["warnings"]) \
+                or not any("Nonsense" in w for w in p["warnings"]):
+            bad.append("dead command / unknown effect not warned")
+        # ksh: lane_toggle alternates, //#vox_ comment lines, header bg_no
+        ksh = os.path.join(d, "fx.ksh")
+        with open(ksh, "w", encoding="utf-8") as fh:
+            fh.write("title=t\nt=120\nbg_no=92\n--\nlane_toggle=96\n"
+                     "//#vox_pe|0|0|48|ColorConversion|Strength|0|100\n"
+                     "//#vox_sp|SpecialN|0|0|LANECLEARCOL|x80202020|i0|i0\n"
+                     "//#vox_bpm|RepresentativeBpm|150\n"
+                     "//#vox_script|3|$offsetY = $offsetY + 0.1\n"
+                     "//#vox_scripted|3|3\n"
+                     "1000|00|--\n0000|00|--\n--\nlane_toggle=48\n0000|00|--\n--\n")
+        p = convert_chart(ksh)
+        v = emit_vox(p).replace("\r\n", "\n")
+        sp = _section_body(v, "SPCONTROLER") or ""
+        for row in ("001,01,00\tLaneY\t2\t96\t0.00\t1024.00\t0.00\t0.00",
+                    "002,01,00\tLaneY\t2\t48\t1024.00\t0.00\t0.00\t0.00",
+                    "001,01,00\tSpecialN\t0\t0\tLANECLEARCOL\tx80202020\ti0\ti0"):
+            if row not in sp:
+                bad.append(f"ksh SPCONTROLER row missing: {row!r}")
+        if "001,01,00\t2\t48\tColorConversion\t0\t0\tStrength\t0.0f\t100.0f" not in v \
+                or "RepresentativeBpm\t150.0000" not in v \
+                or "#SCRIPTED_TRACK3\n001,01,00\t3" not in v:
+            bad.append("ksh //#vox_ lines")
+        if p["header"].get("bg_no") != "92":
+            bad.append("ksh bg_no header")
+    return bad
+
+
 def emit_vox(parsed: dict) -> str:
     tpl = open(TEMPLATE, encoding="latin-1").read()
     pos = _pos_fn(parsed["beat"])
@@ -2022,8 +2777,9 @@ def emit_vox(parsed: dict) -> str:
     # TRACK1 = laser L, 8 = laser R
     infer = not parsed.get("explicit_slams")
     meta = parsed.get("laser_meta") or [None, None]
-    t1 = _laser_track(parsed["laser"][0], pos, infer, meta[0])
-    t8 = _laser_track(parsed["laser"][1], pos, infer, meta[1])
+    spin = _spin_fields(parsed, infer)          # 0.19.0: laser field 4
+    t1 = _laser_track(parsed["laser"][0], pos, infer, meta[0], spin[0])
+    t8 = _laser_track(parsed["laser"][1], pos, infer, meta[1], spin[1])
     # TRACK2 = FX-L, 7 = FX-R, with the per-chart effect table
     fx_body, fx_map = _fx_table(tpl, parsed)
     t2 = _fx_track(parsed["fx"][0], pos, fx_map)
@@ -2059,11 +2815,24 @@ def emit_vox(parsed: dict) -> str:
         # Duration in ticks; an instant row is `0`, as in every official
         # mid-chart row (v13 2330: `073,01,00 2 0 SimpleNoise …`). `1ms` only
         # appears on the template's neutral rows at 001,01,00.
-        out = _replace_section(out, "POSTEFFECT", "\n".join(
-            f"{pos(t)}\t2\t{ln}\t{name}\t0\t0\t"
-            f"{param}\t{_fmt_pe(a)}\t{_fmt_pe(b)}"
-            for t, name, param, a, b, ln in sorted(extras["post_effect"],
-                                                   key=lambda r: r[0])))
+        # 0.20.0: stage / instance index / ms lengths (_posteffect_rows).
+        out = _replace_section(out, "POSTEFFECT",
+                               _posteffect_rows(extras["post_effect"], pos))
+    if extras.get("bpm_option"):
+        # 0.20.0: `Key<TAB>Value` lines right after #BPM INFO (official order)
+        opts = extras["bpm_option"]
+        body = "\n".join(
+            f"{k}\t{opts[k]:.4f}" if k == "RepresentativeBpm" else f"{k}\t{opts[k]}"
+            for k in BPM_OPTIONS if k in opts)
+        n = out.replace("\r\n", "\n")
+        i = n.find("#BPM INFO")
+        j = n.find("#END", i) if i >= 0 else -1
+        if j >= 0:
+            j += len("#END")
+            out = n[:j] + "\n\n#BPM OPTION\n" + body + "\n#END" + n[j:]
+    scripts = _script_sections(extras, pos)
+    if scripts:
+        out = out.replace("\r\n", "\n").rstrip("\n") + "\n\n" + scripts + "\n"
     return out.replace("\r\n", "\n").replace("\n", "\r\n")
 
 
@@ -2108,7 +2877,8 @@ def _spcontroler_rows(parsed: dict, pos, tilt_tweens: list):
     and sorted by time, the way official files list them."""
     extras = parsed.get("vox_extras") or {}
     cam = _cam_rows(parsed)
-    if not (cam or tilt_tweens or extras.get("sp_controller")):
+    if not (cam or tilt_tweens or extras.get("sp_controller")
+            or extras.get("commands")):
         return None
     tpl = open(TEMPLATE, encoding="latin-1").read()
     base = (_section_body(tpl, "SPCONTROLER") or "").strip("\r\n").split("\n")
@@ -2121,8 +2891,12 @@ def _spcontroler_rows(parsed: dict, pos, tilt_tweens: list):
     for name in ("CAM_RotX", "CAM_Radi"):
         lines += [f"{pos(t)}\t{name}\t2\t{d}\t{_fixed(a, 2)}\t{_fixed(b, 2)}\t0.00\t0.00"
                   for t, n, d, a, b in sorted(cam, key=lambda r: r[0]) if n == name]
-    lines += [f"{pos(t)}\tTilt\t2\t{d}\t{_fixed(a, 2)}\t{_fixed(b, 2)}\t0.00\t0.00"
-              for t, d, a, b in sorted(tilt_tweens, key=lambda r: r[0])]
+    lines += [f"{pos(t)}\tTilt\t2\t{d}\t{_fixed(a, 2)}\t{_fixed(b, 2)}"
+              f"\t{_fixed(flag, 2)}\t0.00"
+              for t, d, a, b, flag in sorted(tilt_tweens, key=lambda r: r[0])]
+    # 0.20.0: the editor's game commands (LaneY, BIL_RotZ, Morphing2, BAR,
+    # BAROFF, SpecialN) after everything else; they never replace the base rows
+    lines += _command_rows(extras.get("commands") or [], pos)
     return "\n".join(lines)
 
 
@@ -2270,7 +3044,8 @@ def _dense_changes(sec, k, step) -> int:
     return changes
 
 
-def _laser_track(sections, pos, infer_slams: bool = True, meta=None):
+def _laser_track(sections, pos, infer_slams: bool = True, meta=None,
+                 spins=None):
     """Emit one VOX laser track from a list of sections.
 
     Segment marker (3rd field) per official v13 charts: 1 = section start,
@@ -2298,7 +3073,11 @@ def _laser_track(sections, pos, infer_slams: bool = True, meta=None):
     above the diagonal (b > a) is written 4, below it 5. The segment's start
     point carries the type too, as in official files. Slams and section ends
     are untouched: baking only fills the inside of a segment longer than
-    3 ticks whose value changes."""
+    3 ticks whose value changes.
+
+    0.19.0 (`spins`, {tick: type}): field 4 is the lane spin type, written on
+    the first point of the slam pair at that tick (see _spin_fields)."""
+    spins = dict(spins or {})
     out = []
     for si, sec in enumerate(sections):
         if not sec:
@@ -2323,12 +3102,16 @@ def _laser_track(sections, pos, infer_slams: bool = True, meta=None):
                         y = _curve_y((tt - t) / (t1 - t), *c)
                         rows.append((tt, v + (v1 - v) * y, kind))
                     continue
-            rows.append((t, v, 0))
+            spin = 0
+            if t in spins and idx + 1 < len(pts) and pts[idx + 1][0] == t \
+                    and pts[idx + 1][1] != v:
+                spin = spins.pop(t)                 # first point of the slam
+            rows.append((t, v, 0, spin))
         last = len(rows) - 1
-        for idx, (t, v, kind) in enumerate(rows):
+        for idx, (t, v, kind, *sp) in enumerate(rows):
             seg = 1 if idx == 0 else (2 if idx == last else 0)
-            out.append(f"{pos(t)}\t{_fixed(v / 50.0, 6)}\t{seg}\t0\t{filt}\t{width}"
-                       f"\t0\t{kind}\t0\t0")
+            out.append(f"{pos(t)}\t{_fixed(v / 50.0, 6)}\t{seg}\t{sp[0] if sp else 0}"
+                       f"\t{filt}\t{width}\t0\t{kind}\t0\t0")
     return "\n".join(out)
 
 
@@ -3560,6 +4343,18 @@ def main():
                                     "-0.00, ManualSpeed in LOCKED_SPCONTROLER, "
                                     "POSTEFFECT length 0, scroll ramp bound, "
                                     "ranged t= header, radar BPM dedupe)"
+                                    if not bad else "FAILED — " + "; ".join(bad)))
+        bad = _check_camera()
+        print("  0.19 camera : " + ("ok (spin types by kind/length, ksh/kson spin "
+                                    "parsing, spin on the slam's first point, spin "
+                                    "without a slam warned, Tilt block markers 2/0/3/1 "
+                                    "with hold rows)"
+                                    if not bad else "FAILED — " + "; ".join(bad)))
+        bad = _check_effects()
+        print("  0.20 effects: " + ("ok (#POSTEFFECT stage/index/ms + typo fix, "
+                                    "SPCONTROLER commands as 8 fields, dead commands "
+                                    "dropped, #BPM OPTION, note scripts + validation, "
+                                    "ksh lane_toggle / //#vox_ lines / bg_no)"
                                     if not bad else "FAILED — " + "; ".join(bad)))
         try:
             from PIL import Image  # noqa: F401

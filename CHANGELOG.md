@@ -11,6 +11,252 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.20.0] - 2026-10-27
+
+Game effects for "full creative freedom" in the SDVX Chart Editor — but only
+effects the game actually executes. Basis: the reverse-engineered VOX parser
+and consumers of the running `soundvoltex.dll` (Ghidra, 2026-10-27; notes
+outside the repo) and a survey of all 8,602 official charts. Charts that use
+none of these features convert **byte-identically** to 0.19.0 (all 24 library
+charts diffed).
+
+### Added
+- **#POSTEFFECT, complete.** Rows are `pos type len Effect stage index Param
+  from to` (9 fields). The editor's rows now carry the **stage** (0 = the
+  background's effect stage, 1 = "Overall"/lane stage; stages exist only where
+  the song's background defines them, see bg_no below), the **instance
+  index** (5th field — the official 2087 drives two ColorConversions in one
+  stage with index 0 and 1; it was written as a constant 0 before) and a
+  length in ticks **or `<n>ms`**. The 2nd field is parsed but never read by
+  the game; `2` is written as before. All eight effects: ChromaticAberration,
+  ColorConversion (Mode 0 grayscale, 1 sepia, 2 negative, 3 negative +
+  complement, 4 hue rotation; Strength %, mode 4 degrees), RadicalBlur,
+  SimpleNoise, CrtMonitorEffect, LuminousEffect, SetFrameLabel, RandomShake.
+  `ChromaticAberration` is written with its correct name; the official
+  misspelling `ChromaticAbberation` (109 rows) only works because unknown names
+  fall back to effect 0 — it is accepted on input as an alias. Any other
+  unknown effect name is dropped with a warning (it would silently become a
+  chromatic aberration).
+- **SPCONTROLER commands** (`impl["sdvx-editor"].vox.commands`): `LaneY`
+  (lane slide/hide, value/1024), `BIL_RotZ` (`d` degrees), `Morphing2`
+  (×0.125, shape unknown), `BAR` / `BAROFF` (bar lines), `SpecialN` kinds
+  LANECOL, LANECLEARCOL, FRAME, SE, SE2, LIVE2D, NEMSYS, SIDEBG, EXMC_LABEL,
+  EXMC_PARAM, RENDER_PRESET, DISABLE_PRE_EFFECT_LINE, EXBG, EXBGTEX. Values are
+  VOX tokens (`f`/`i`/`x`/`d` prefixes and table names) and are written
+  verbatim after validation; every row has exactly the 8 whitespace fields the
+  parser requires (`%d,%d,%d\t%s%s\t%d\t%s\t%s\t%s\t%s` — any other count and
+  the game drops the row silently). They are appended after the base,
+  camera and tilt rows and never replace the template's Realize rows (the
+  older `sp_controller` list still does).
+- **Dead commands are refused.** LaneX, GEO_RotZ/RotX, Tilt_Mag, 3D_Scroll,
+  Morphing0/1/3, HudY, AIRL/AIRR_ScaX, CAM_PosY/PosZ … and the SpecialN kinds
+  LANEMODEL0..3, LANEDISP, SIDE, ADJRVZ, EXBGROTF … are parsed by the game and
+  then never read; written, they would be invisible. They are dropped with a
+  warning.
+- **#BPM OPTION** (`RepresentativeBpm <float>` — overrides the tempo the
+  game's hi-speed is based on; `ConstantScroll 0|1`), written right after
+  `#BPM INFO` like the 26 official files that have it.
+- **Note scripts**: `#SCRIPT_DEFINE` (`@SCRIPTSTART <id>` … `@SCRIPTEND`) and
+  `#SCRIPTED_TRACK1..8` (`pos <id> [<id> …]`). Statements are validated
+  against the grammar of the official scripts (1751, 2330): `$targetStep`,
+  `$offsetX` or `$offsetY` `=` an arithmetic expression over numbers (optional
+  `f`), `$targetStep`, `$offsetX`, `$offsetY`, `$currentStep`, `+ - * /`,
+  parentheses, optional `when <expr> <op> <expr>` with `== != < <= > >=`. A
+  script with an invalid line is dropped; an assignment whose track has no
+  note starting exactly at that position is dropped (the game attaches it to
+  that note only). Only scripts that are used are written.
+- **ksh carries all of it**: `lane_toggle=<len>` (native KSM option, len in
+  1/192 of a measure) becomes `LaneY 2 <len> 0.00 1024.00` / `1024.00 0.00`,
+  alternating hide/show — the mapping VoxCharger and VOX2KSH use, and the
+  official rows' shape (0791 `LaneY 2 240 0.00 1024.00`, tutorial comment
+  「レーン消える」/「レーン復帰」). The chart editor writes everything else as
+  comment lines after the first `--`, which K-Shoot skips:
+  `//#vox_pe|stage|index|len|Effect|Param|from|to` (len ticks or `<n>ms`),
+  `//#vox_sp|Name|type|len|p1|p2|p3|p4`, `//#vox_bpm|Key|Value`,
+  `//#vox_script|id|statement`, `//#vox_scripted|track|id[,id…]`; the position
+  is the line's own. `bg_no=<n>` in the ksh header is the music_db background
+  (it was already read as a header key; now documented).
+- `--self-check` reports "0.20 effects": exact rows for a kson and a ksh with
+  every new feature, dead commands dropped, 8 fields per row, official script
+  lines accepted, malformed ones refused.
+
+### Needs an in-game test
+Every one of these parses exactly like official rows, but what it looks like
+has not been seen yet:
+1. Any #POSTEFFECT on a background without its own effect stages (bg_no 0,
+   or a common one like 5): every official chart that uses post effects has a
+   dedicated background (bg_no 92–118, one on 5). On bg 0 they may do nothing.
+2. Which stage covers the lane vs. the background on a given bg; is the HUD
+   untouched?
+3. LaneY: does +1024 slide the lane down or up, −1024 the other way?
+4. Morphing2's visual; BIL_RotZ's target (lane, jacket billboard or
+   background).
+5. ConstantScroll; DISABLE_PRE_EFFECT_LINE / RENDER_PRESET.
+
+## [0.19.0] - 2026-10-27
+
+Camera work that 0.17/0.18 still dropped, measured on all 8,602 official charts
+of the running game version (every `data/music/*/*.vox`: FORMAT VERSION 10:
+5,577, 12: 2,689, 13: 336). The public converters VoxCharger (ksh → vox), VOX2KSH
+(TsFreddie) and vox2ksh (zacharied) were read as second opinions; where only
+they can say what something means, it is marked as a hypothesis.
+
+### Added
+- **Lane spins → laser field 4.** ksh `@(` `@)` (spin), `@<` `@>` (half spin),
+  `S<` `S>` (swing) and kson `camera.cam.pattern.laser.slam_event`
+  (`spin` / `half_spin` / `swing`) are written as the VOX spin type on the
+  **first point of the slam** at the spin's position — where official charts
+  put it.
+
+  What the official data proves:
+
+  | id | rows | charts | on a slam's 1st point | slam left / right | v13 rows | earliest song version (NOV/ADV/EXH/MXM) |
+  |---|---|---|---|---|---|---|
+  | 1 | 9,232 | 4,568 | 9,221 | 4,658 / 4,563 | 710 | 1 |
+  | 2 | 3,194 | 1,653 | 3,182 | 1,603 / 1,579 | 14 | 2 |
+  | 3 | 4,617 | 2,623 | 4,545 | 2,247 / 2,298 | 5 | 1 |
+  | 4 | 34 | 33 | 34 | 22 / 12 | 6 | 3 |
+  | 5 | 2,272 | 1,473 | 2,271 | 1,113 / 1,158 | 131 | 2 |
+  | 6 | 395 | 213 | 395 | 180 / 215 | 132 | 6 (EXCEED GEAR) |
+  | 7 | 122 | 83 | 120 | 59 / 61 | 58 | 6 (EXCEED GEAR) |
+
+  - 99.5 % of the 19,866 non-zero values sit on the first point of a
+    same-position pair; the rest are 9 + 11 + 9 + 1 + 2 rows on a pair's
+    second point and 66 on a lone point (63 of them in one chart, 1697 MXM).
+  - **The id carries no direction**: every id sits on left and right slams
+    alike, so the turn direction is the slam's own.
+  - **The id carries no length**: no id prefers a time signature (3.7–4.7 %
+    of the spins of ids 1, 2, 3 and 5 alike sit in a 3/4 bar), so each id is
+    a fixed animation. A spin at the same position on both lanes is rare (95
+    positions, 91 of them with the same id twice).
+
+  What the ids *mean* comes from the converters (hypothesis):
+
+  | id | VOX2KSH (vox → ksh) | vox2ksh | VoxCharger | written for |
+  |---|---|---|---|---|
+  | 1 | `@(192` (one measure) | MEASURE | Measure (every `@(`) | spin ≥ 136 |
+  | 2 | `@(48` | HALF_MEASURE | HalfMeasure (`@<`) | spin < 68 |
+  | 3 | `@(96` | THREE_BEAT | ThreeBeat (`@(` ≤ 144) | spin 68–135 |
+  | 4 | `@(432` + two extra turns of tilt | CANCER | TripleMeasure | — |
+  | 5 | `@<96` | SWING → `@<` | Swing (`S`, short `@<`) | half spin, swing |
+  | 6, 7 | — | — | — | — |
+
+  All three rank the spin durations the same way, 2 < 3 < 1 < 4, so a K-Shoot
+  spin (always one turn, the length scales its speed) becomes 2, 3 or 1 by
+  length — boundaries at the geometric means of VOX2KSH's lengths (48 | 68 |
+  96 | 136 | 192, in 1/192 of a measure). Type 4 adds turns K-Shoot does not
+  have, so a long spin stays 1. A half spin is 5 (two of three converters). A
+  swing is 5 too: VoxCharger is the only converter that writes swings at all,
+  and 6/7 — the newest types — are known to none of them, so they are never
+  written.
+  - A spin needs a slam at its position; without one it is dropped with a
+    warning. A slam turning the other way still takes the spin (the VOX
+    direction is the slam's, warned). Both lanes slamming at the spin's
+    position: the lane turning the spin's way, left first.
+  - One warning per chart lists the spins whose length is more than 1.5× off
+    their type's nominal length (VOX2KSH's) and every swing (scale / repeat /
+    decay are not representable).
+  - Library (8 songs, 24 charts): 187 authored spins → 180 written (type 1: 49,
+    2: 44, 3: 29, 5: 58), 7 without a slam dropped, 15 against their slam's
+    direction. Of the 180 library spins with a slam, 165 turn the slam's way —
+    the direction convention (`(`/`<` = left = falling value) is the editor's
+    KshReader's and VOX2KSH's.
+- **Tilt block marker (row field 7).** Official Tilt rows form blocks: every
+  row inside a block starts where the previous one ends (13,882 of 13,882) and
+  continues its value; field 7 marks the block — **2 first row, 0 middle,
+  3 last row, 1 a block of one row**.
+
+  | field 7 | rows | grammar position |
+  |---|---|---|
+  | 0 | 12,295 | inside a block (12,204) |
+  | 2 | 1,682 | opens a block (1,681) |
+  | 3 | 1,678 | closes it (1,677) |
+  | 1 | 1,116 | a whole block (1,116) |
+
+  978 of the 987 official charts with Tilt rows follow this without a single
+  exception; one chart (0706 kitasaitama EXH) has 89 middle rows outside any
+  block, eight have one stray row or a block still open at the end. Between
+  blocks there is a gap in 1,811 of 1,902 cases and the next block starts from
+  a different value in 533 — the value is not carried over, i.e. outside a
+  block the automatic tilt applies (the grammar is measured, this meaning is
+  the hypothesis). Field 7 is Tilt-only: CAM_RotX / CAM_Radi rows carry 0
+  there (62,991 / 160,383 rows).
+
+  ksh2vox now groups its Tilt rows the same way and marks them. A manual value
+  that is held — until the next auto mode, or to the chart end — gets a hold
+  row (from = to) that ends the block, as official charts do (0061 retrospec
+  INF holds 0.50 for 5,168 ticks to its end). Until now a 0-tick reset row
+  (last → 0) stood at the auto mode instead, and a value held to the chart end
+  had no row at all. A lone manual point is one hold row (type 1), no longer a
+  0-tick row plus nothing.
+
+### Not representable (unchanged, now with evidence)
+Every SPCONTROLER row type of the official charts, by rows / charts:
+CAM_Radi 160,380, CAM_RotX 63,000, Realize 17,216, Tilt 16,771, AIRL/AIRR_ScaX
+8,605 / 8,601, SpecialN 4,719 (EXMC labels, sound effects, Live2D), BAROFF
+1,334, BIL_RotZ 287 (4 charts), BAR 56, LaneY 51, HudY 48, ManualSpeed 30,
+Morphing2 16, BGROT 4. The DLL also names CAM_PosY, CAM_PosZ, Tilt_Mag,
+3D_Scroll, BIL_H and Morphing0/1/3 — used by no official chart.
+- **zoom_side** (sideways lane shift): no row type moves the lane sideways.
+- **center_split**: nothing comparable. Morphing2 (0 → 0.8 tweens, 5 charts)
+  is a lane morph of unknown shape.
+- **rotation_deg**: `BIL_RotZ` rotates in degrees (`d0` → `d-45` tweens;
+  0271 vallis INF steps it every 3 ticks) — but the developers' own comments in the tutorial chart (0840) call
+  it the *billboard* (「ビルボードを 0°→-45°」), in 4 charts only, and VOX2KSH
+  reads it as manual tilt. Not solid enough to write.
+- `LaneY 0 → 1024` is the lane hiding (tutorial comment 「レーン消える」 / 「レーン
+  復帰」, ksh `lane_toggle` in VoxCharger and VOX2KSH) — not part of this
+  release.
+
+### Found, not changed
+- **Realize defaults.** 6,909 charts start with `Realize 3 36.12 60.12 110.12`
+  / `Realize 4 0.62 0.72 1.03` (v13: 331 of 336), 1,492 with the template's
+  `17.12 … / 0.28 0.72 1.57` — and those are the songs of game versions 1 and
+  2 (1,460 of 1,573 charts there; from version 3 on 36.12 has 6,936 of 7,012).
+  The tutorial chart comments name the rows: Realize 3 = `CAMERA_RadiusYZ`,
+  Realize 4 = `SPC_TARGET_CAMERA_RotX`. The template keeps its values (verified
+  working in game); switching to the current default is a camera play test.
+- **Manual tilt sign.** All three converters flip the sign between ksh and VOX
+  (VoxCharger `vox = -ksh` "untested", vox2ksh `ksh = -vox`, VOX2KSH
+  `ksh = -1.5 × vox`); ksh2vox writes `vox = +ksh` since 0.17.0 (that release
+  called it "the VOX2KSH reading", which it is not). Left as it is pending the
+  play test below.
+
+### Verified
+- Full library conversion (8 songs, 24 charts) against 0.18.0: audio, jackets,
+  music_db and every non-camera line byte-identical; the `.vox` files differ
+  only in laser field 4 (180 rows) and in Tilt rows (4 charts: Aegleseeker MXM,
+  GΛLVΛNIZER MXM, The Devil Incarnate EXH / MXM — field 7 markers, 5 hold rows
+  added, 5 reset rows removed; 201 Tilt rows before and after). `import_map.json` differs only in `converter`.
+  Non-spin warnings identical. §6 rules hold: laser starts = ends, ≤ 2 points
+  per position, 10 laser fields, values 0..1, CRLF only, every spin id on a
+  slam's first point, every Tilt block well-formed.
+- **Round trip of the official charts** (all 7,001 files with a spin, 19,768
+  spins on a slam): VOX → SDVX Chart Editor VoxReader → kson → ksh2vox.
+  - With the editor's VoxReader as it is (every id read as a nominal one-beat
+    spin, direction right): the spin survives on 19,054 (96.4 %; 714 more land
+    on the other lane of a two-lane slam), but the type is right only for the
+    3,066 type-2 spins (15.5 %) — one beat is type 2.
+  - With the ids read back through this table (1 → spin 192, 2 → 48, 3 → 96,
+    5 → half spin 96, direction = the slam's): 18,550 of the 19,219 spins of
+    types 1/2/3/5 come back with the same type on the same slam (96.5 %); the
+    other 669 come back on the other lane of a two-lane slam. Types 4, 6 and 7
+    (549) are not written by design.
+- `--self-check` checks the spin types by kind and length, ksh suffix and kson
+  `slam_event` parsing, the spin on a slam's first point, the warning for a
+  spin without a slam, and the Tilt block markers with hold rows.
+
+### Needs a play test
+1. Spin types 1/2/3/5 — does a K-Shoot spin look right, and is a swing as
+   type 5 acceptable?
+2. Tilt blocks: does the game release to auto tilt at a block end (3 / 1)?
+3. Manual tilt sign and scale (see "Found, not changed").
+
+- Bumped because the `.vox` output changes: every song re-converts once on the
+  next import.
+
+---
+
 ## [0.18.0] - 2026-10-26
 
 ### Changed

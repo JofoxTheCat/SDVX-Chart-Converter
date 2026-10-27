@@ -21,7 +21,8 @@ python ksh2vox.py --self-check
 ```
 
 Prints the version and which optional parts are active — skill radar model
-and classic radar, template, ffmpeg, Pillow. Run this first whenever something
+and classic radar, template, ffmpeg, Pillow — and runs the synthetic checks
+(positions, the 0.17 mappings, the 0.19 spin types and Tilt blocks). Run this first whenever something
 behaves unexpectedly; a missing `radar_model.json` / `radar.py` or a stale copy
 of the script explains most surprises.
 
@@ -114,20 +115,35 @@ named `mxm` while the header still says `infinite`.
 | Wide lasers (`laserrange_*=2x`, kson `w`) | width 2, values over the wide range (0.17.0); a ksh `laserrange` widens only the next section |
 | Laser curves (kson `[a, b]`) | baked into points every 3 ticks like official charts (0.17.0); a `.ksh` already carries K-Shoot's own baked points |
 | Laser filters (`filtertype`, kson `pulse_event`) | peak / low-pass / high-pass / bit crusher (0.17.0); other laser effects fall back to peak with a warning |
-| Tilt | auto modes normal / bigger / keep_bigger, manual tilt as `Tilt` rows (0.17.0) |
+| Tilt | auto modes normal / bigger / keep_bigger, manual tilt as `Tilt` rows (0.17.0) in official blocks: field 7 marks first / middle / last / single row, a held value ends in a hold row (0.19.0) |
 | Camera `zoom_top` / `zoom_bottom` | `CAM_RotX` / `CAM_Radi` rows, clamped to the official ±1 (0.17.0) |
 | Scroll speed / stops | `ManualSpeed` rows in `#LOCKED_SPCONTROLER` (official v13 form) / `4-` BPM rows (0.17.0) |
 | Skill radar | computed per chart from a model fitted on the official charts (see below) |
-| Effect parameter changes, spins, `zoom_side`, `center_split`, custom key sounds | not representable — reported once per chart |
+| Lane spins (`@(` `@)` `@<` `@>` `S<` `S>`, kson `slam_event`) | VOX spin type in laser field 4 on the slam at the spin's position: spin → 2 / 3 / 1 by length, half spin and swing → 5; the direction is the slam's; a spin without a slam is dropped (0.19.0, warned when approximated) |
+| `lane_toggle` | `LaneY` 0 → 1024 (hide) / 1024 → 0 (show), alternating, length in 1/192 of a measure (0.20.0) |
+| Game effects from the SDVX Chart Editor | `#POSTEFFECT` (all 8 effects, stage / instance / ms lengths), `LaneY`, `BIL_RotZ`, `Morphing2`, `BAR` / `BAROFF`, `SpecialN` (lane colours, frame, sounds, Live2D, EXBG …), `#BPM OPTION`, note scripts (0.20.0) — see below |
+| Effect parameter changes, `zoom_side`, `center_split`, `rotation_deg`, custom key sounds | not representable — reported once per chart |
 
 Each mapping was measured against the official v13 charts; the ones that still
-need an in-game test are listed in `CHANGELOG.md` under 0.17.0. A chart without
+need an in-game test are listed in `CHANGELOG.md` under 0.17.0 and 0.19.0. A chart without
 any of these keeps the template's defaults verbatim.
 
 Charts saved by the SDVX Chart Editor can carry VOX-only data in
 `impl["sdvx-editor"].vox` (background `bg_no`, `#POSTEFFECT` and
 `#SPCONTROLER` rows); it is used when present. Malformed entries there are
-skipped with a warning. In a batch, a song whose conversion fails is reported
+skipped with a warning.
+
+Since 0.20.0 the same block carries game effects — `post_effect` rows with
+stage / instance index / ms length, `commands` (SPCONTROLER rows with VOX
+tokens: `LaneY`, `BIL_RotZ`, `Morphing2`, `BAR`, `BAROFF`, `SpecialN`),
+`bpm_option` (`RepresentativeBpm`, `ConstantScroll`) and note scripts
+(`scripts`, `scripted`). A `.ksh` saved by the editor carries them as comment
+lines after the first `--` (`//#vox_pe|…`, `//#vox_sp|…`, `//#vox_bpm|…`,
+`//#vox_script|…`, `//#vox_scripted|…`, which K-Shoot skips) plus the header key
+`bg_no=`. Commands the game parses but never reads (LaneX, GEO_RotZ, Tilt_Mag,
+Morphing0/1/3, HudY, LANEDISP …) are dropped with a warning; every row is
+written with exactly the 8 fields the game's parser requires. Format
+reference: the chart editor's `docs/VOX_EFFECTS.md`. In a batch, a song whose conversion fails is reported
 and the remaining songs still convert.
 
 ## Skill radar
