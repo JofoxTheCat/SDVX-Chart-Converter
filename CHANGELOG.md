@@ -11,6 +11,114 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.18.0] - 2026-10-26
+
+### Changed
+- **Skill radar from a fitted model.** The music_db `<radar>` values now come
+  from `radar_model.py`, a port of the SDVX Chart Editor's data-driven radar:
+  85 time-based pattern features per chart (chord density over 1.25 s, hold
+  seconds, knob time and travel, notes played while the *other* / the *same*
+  hand's knob moves, tempo changes, …) and one additive model per axis —
+  intercept, linear terms and gradient-boosted regression trees — read from
+  `radar_model.json`. The model file was fitted by the editor's calibrator on
+  the official charts of the user's own game install and holds aggregate
+  numbers only (weights, split thresholds, leaf values), no chart data.
+  Values are on the music_db scale and clamped to 0..200 like official ones
+  (radar.py wrote up to 336).
+
+  Accuracy against the official music_db radar, 8,573 charts, 5-fold CV grouped
+  by song (from the model file's own metrics):
+
+  | Axis | classic radar.py MAE / r | model CV MAE / r | hold-out (id ≥ 2100) MAE |
+  |---|---|---|---|
+  | NOTES | 13.4 / 0.996 | **0.10** / 1.000 | 0.14 |
+  | PEAK | 28.4 / 0.920 | **2.00** / 0.996 | 2.21 |
+  | TSUMAMI | 27.7 / 0.434 | **2.34** / 0.987 | 2.14 |
+  | TRICKY | 24.4 / 0.567 | **10.7** / 0.825 | 12.6 |
+  | HAND-TRIP | 42.6 / 0.787 | **2.81** / 0.972 | 2.91 |
+  | ONE-HAND | 10.5 / 0.935 | **3.22** / 0.989 | 3.22 |
+
+  TRICKY stays the weakest axis: part of it is era-dependent and not in the
+  chart, and camera features are deliberately not model inputs (fan charts use
+  the camera at any difficulty; with them a fan NOV out-scored its own MXM).
+- `radar.py` is unchanged and stays available as `--radar classic`
+  (`set_radar_mode("classic")` for importers). Without `radar_model.py` or
+  `radar_model.json` the converter falls back to it with one warning per run.
+  The radar in use is recorded per song in `import_map.json` (`"radar"`), so
+  switching re-converts exactly the songs written the other way.
+- The parsers record a pulse-precise chart description next to their tick data
+  (`parsed["radar_input"]`, 240 pulses per quarter): ticks cannot hold a line of
+  a 40- or 36-line ksh measure (galvanizer, AureoLe), and the rhythm-grid
+  features look at pulse mod 60 / 40. It is read the way the editor's
+  KshReader / KsonReader read the file (ksh slams by the same 1/32 rule with the
+  dense-movement exception, `laser_l/r_curve` kept on its point, explicit kson
+  slams, curves and widths, lane spins counted). The VOX path never reads it.
+- When ksh2vox is loaded by file path (the V2 launcher bridge), `radar_model.py`
+  is taken from beside `ksh2vox.py`; before the launcher knows the new file it
+  still gets the model radar instead of silently falling back.
+
+### Verified
+- **Parity with the editor.** All 25 chart files of the Nautica library (24 +
+  the ABYSS MOTION `.ksh` twin): every one of the 85 features equals the
+  editor's `PatternAnalysis` bit for bit, and the six radar values equal
+  `SkillRadarModel.EstimateFile`. The editor test
+  `RadarTests.LibraryChartsMatchRadarModelPy` checks this without tolerance;
+  `LibraryChartsMatchRadarPy` (classic port vs radar.py) still passes 25/25.
+  One detail needed for that: the editor sorts with .NET's unstable introsort,
+  and the tie order of laser travel events at the same instant decides a
+  floating-point sum — on official chart 2282 MXM `laser_speed_peak` came out
+  one ulp off, exactly on a tree threshold, TRICKY 57 instead of 56. The port
+  now sorts with the same algorithm.
+- **All 8,572 official charts** with a music_db radar, read by the editor's
+  VoxReader, written as kson and converted by ksh2vox: 8,572 / 8,572 identical
+  to the editor (on the VOX and on the kson). In-sample MAE against music_db
+  (these are the training charts, so lower than the CV numbers above): NOTES
+  0.10, PEAK 1.53, TSUMAMI 1.75, TRICKY 8.08, HAND-TRIP 1.64, ONE-HAND 2.26;
+  radar.py on the same charts 13.4 / 28.4 / 27.7 / 24.4 / 42.6 / 10.4.
+- Full conversion of the library with 0.17.1 and 0.18.0: every `.vox`, `.2dx`
+  and jacket is byte-identical; the merged music_db differs only inside
+  `<radar>`, `import_map.json` only in `converter` and the new `radar`.
+  `--radar classic` reproduces the 0.17.1 music_db byte for byte. Laser
+  sections close (1s = 2s per track), same-position runs are 1 or 2, no
+  `\r\r\n`, no empty `<maximum>`.
+- Speed: the 8-song library converts in 4.2 s (3.9 s with 0.17.1, ffmpeg
+  included); the radar itself is ~5 ms per chart (8,572 charts in 46 s).
+- `--self-check` reports the model (version, generation date, training size)
+  and checks it on synthetic charts: empty chart all zero, every feature the
+  model needs is computed, values in range, half-away-from-zero rounding.
+
+| Chart | 0.17.1 radar.py (N / P / Ts / Tr / HT / OH) | 0.18.0 model |
+|---|---|---|
+| ABYSS MOTION 192.333 INF | 110 / 61 / 47 / 40 / 162 / 126 | 115 / 128 / 76 / 56 / 98 / 105 |
+| Aegleseeker[20.9] MXM | 143 / 74 / 46 / 39 / 336 / 268 | 165 / 200 / 107 / 115 / 86 / 114 |
+| ΛμreoLe=RushOVER=E ~for Λnge EXH | 125 / 67 / 40 / 140 / 167 / 154 | 140 / 160 / 70 / 110 / 58 / 115 |
+| ΛμreoLe=RushOVER=E ~for Λnge MXM | 150 / 86 / 41 / 292 / 187 / 165 | 179 / 192 / 60 / 114 / 64 / 106 |
+| Canto IX Boss 10 Battle Them NOV | 38 / 38 / 18 / 24 / 0 / 0 | 15 / 33 / 25 / 29 / 0 / 3 |
+| Canto IX Boss 10 Battle Them ADV | 58 / 41 / 20 / 24 / 41 / 45 | 40 / 59 / 45 / 43 / 8 / 48 |
+| Canto IX Boss 10 Battle Them EXH | 76 / 53 / 21 / 24 / 80 / 73 | 66 / 98 / 55 / 53 / 28 / 66 |
+| Canto IX Boss 10 Battle Them MXM | 97 / 57 / 22 / 54 / 132 / 120 | 97 / 144 / 66 / 67 / 94 / 104 |
+| Jumpy star NOV | 34 / 34 / 17 / 0 / 0 / 0 | 11 / 22 / 55 / 24 / 0 / 1 |
+| Jumpy star ADV | 57 / 40 / 17 / 0 / 58 / 44 | 44 / 57 / 47 / 35 / 0 / 33 |
+| Jumpy star EXH | 61 / 43 / 20 / 0 / 56 / 51 | 49 / 65 / 59 / 38 / 0 / 44 |
+| Jumpy star MXM | 74 / 51 / 20 / 0 / 102 / 85 | 69 / 81 / 78 / 40 / 69 / 84 |
+| GΛLVΛNIZER NOV | 48 / 40 / 18 / 0 / 18 / 13 | 30 / 39 / 25 / 7 / 0 / 6 |
+| GΛLVΛNIZER ADV | 71 / 48 / 24 / 31 / 57 / 44 | 61 / 79 / 34 / 43 / 0 / 28 |
+| GΛLVΛNIZER EXH | 102 / 55 / 37 / 33 / 161 / 135 | 107 / 128 / 62 / 52 / 24 / 68 |
+| GΛLVΛNIZER MXM | 126 / 60 / 40 / 114 / 287 / 237 | 143 / 161 / 86 / 77 / 74 / 107 |
+| The Devil Incarnate NOV | 46 / 43 / 17 / 0 / 12 / 12 | 26 / 47 / 26 / 8 / 0 / 6 |
+| The Devil Incarnate ADV | 82 / 48 / 21 / 13 / 31 / 30 | 72 / 101 / 18 / 45 / 1 / 32 |
+| The Devil Incarnate EXH | 118 / 54 / 26 / 47 / 114 / 107 | 126 / 134 / 39 / 58 / 35 / 91 |
+| The Devil Incarnate MXM | 146 / 76 / 37 / 180 / 199 / 175 | 169 / 200 / 53 / 108 / 91 / 123 |
+| じゃすと・べりー・くいっくりー！ NOV | 45 / 34 / 14 / 0 / 11 / 11 | 27 / 27 / 16 / 5 / 0 / 2 |
+| じゃすと・べりー・くいっくりー！ ADV | 59 / 40 / 18 / 0 / 24 / 25 | 43 / 46 / 42 / 13 / 0 / 22 |
+| じゃすと・べりー・くいっくりー！ EXH | 99 / 51 / 33 / 0 / 184 / 154 | 104 / 111 / 49 / 40 / 17 / 81 |
+| じゃすと・べりー・くいっくりー！ INF | 107 / 51 / 31 / 11 / 183 / 154 | 112 / 112 / 55 / 47 / 16 / 85 |
+
+- Bumped because the music_db output changes: every song re-converts once on
+  the next import.
+
+---
+
 ## [0.17.1] - 2026-10-26
 
 ### Fixed

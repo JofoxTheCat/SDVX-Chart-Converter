@@ -20,9 +20,10 @@ SDVX VII).
 python ksh2vox.py --self-check
 ```
 
-Prints the version and which optional parts are active — skill radar, template,
-ffmpeg, Pillow. Run this first whenever something behaves unexpectedly; a missing
-`radar.py` or a stale copy of the script explains most surprises.
+Prints the version and which optional parts are active — skill radar model
+and classic radar, template, ffmpeg, Pillow. Run this first whenever something
+behaves unexpectedly; a missing `radar_model.json` / `radar.py` or a stale copy
+of the script explains most surprises.
 
 ## Usage
 
@@ -79,6 +80,8 @@ entry, so re-running the same id is safe.
   are written as cp932 bytes; characters cp932 cannot represent are folded to a
   close equivalent (`Ø` → `O`, accents stripped) rather than escaped, because the
   game does not resolve XML numeric character references.
+- `--radar {model,classic}`: which skill radar to write (default `model`, see
+  [Skill radar](#skill-radar)).
 - `--radar-names {hyphen,underscore}`: radar tag spelling. Both are accepted by
   `soundvoltex.dll`; the default matches a known-good db.
 - `--max-exscore`: also emit `<max_exscore>`. Off by default — the value could
@@ -114,7 +117,7 @@ named `mxm` while the header still says `infinite`.
 | Tilt | auto modes normal / bigger / keep_bigger, manual tilt as `Tilt` rows (0.17.0) |
 | Camera `zoom_top` / `zoom_bottom` | `CAM_RotX` / `CAM_Radi` rows, clamped to the official ±1 (0.17.0) |
 | Scroll speed / stops | `ManualSpeed` rows in `#LOCKED_SPCONTROLER` (official v13 form) / `4-` BPM rows (0.17.0) |
-| Skill radar | computed per chart (see below) |
+| Skill radar | computed per chart from a model fitted on the official charts (see below) |
 | Effect parameter changes, spins, `zoom_side`, `center_split`, custom key sounds | not representable — reported once per chart |
 
 Each mapping was measured against the official v13 charts; the ones that still
@@ -129,16 +132,41 @@ and the remaining songs still convert.
 
 ## Skill radar
 
-`radar.py` computes the six radar axes (notes, peak, tsumami, tricky, hand-trip,
-one-hand) per chart and writes them into `music_db`. The scaling formulas and the
-10–1000 clamp are ported from [kshoot-tools](https://github.com/123jimin/kshoot-tools)'
-`radar.ts` (MIT); the underlying statistics are reimplemented and calibrated
-against reference numbers from real songs.
+The six radar axes (notes, peak, tsumami, tricky, hand-trip, one-hand) are
+computed per chart and written into `music_db`.
 
-These are approximations — upstream itself notes that a more accurate TRICKY
-formula is still open — but the values land inside the range of real songs on
-every axis. `radar.py` is optional: if it is missing, conversion still works and
-all radar values are `0`, which collapses the in-game hexagon to a point.
+**Default since 0.18.0: `radar_model.py` + `radar_model.json`.** A port of the
+SDVX Chart Editor's radar: 85 time-based pattern features per chart (chord
+density, hold seconds, knob time and travel, buttons pressed while a knob
+moves, tempo changes, …) feed one model per axis — linear terms plus
+regression trees, fitted on the official charts. The JSON file holds only the
+fitted numbers (weights, split thresholds, leaf values), no chart data. For the
+same chart the converter writes exactly the values the editor shows.
+
+Error against the official music_db radar (8,573 charts, 5-fold CV grouped by
+song):
+
+| Axis | `radar_model` MAE | classic `radar.py` MAE |
+|---|---|---|
+| NOTES | 0.10 | 13.4 |
+| PEAK | 2.0 | 28.4 |
+| TSUMAMI | 2.3 | 27.7 |
+| TRICKY | 10.7 | 24.4 |
+| HAND-TRIP | 2.8 | 42.6 |
+| ONE-HAND | 3.2 | 10.5 |
+
+TRICKY is the weakest axis: part of it depends on the game era rather than the
+chart, and camera work is deliberately not an input (fan charts use the camera
+at every difficulty).
+
+**Classic: `radar.py`** (`--radar classic`). The scaling formulas and the
+10–1000 clamp are ported from [kshoot-tools](https://github.com/123jimin/kshoot-tools)'
+`radar.ts` (MIT); the statistics are reimplemented. Kept for comparison and as
+the fallback: without `radar_model.py` or `radar_model.json` the converter
+warns once and uses `radar.py`; without both, conversion still works and all
+radar values are `0`, which collapses the in-game hexagon to a point. The radar
+in use is recorded per song in `import_map.json`, so switching it re-converts
+the affected songs on the next import.
 
 ## Audio
 
@@ -175,7 +203,8 @@ first. Without Pillow the source image is copied through unresized.
 - **Pillow** (`pip install -r requirements.txt`) — jacket resizing
 - **ffmpeg** on PATH — audio
 
-`ksh2vox.py`, `radar.py` and `template_v13.vox` must sit in the same folder.
+`ksh2vox.py`, `radar_model.py`, `radar_model.json`, `radar.py` and
+`template_v13.vox` must sit in the same folder.
 
 ## Notes & scope
 

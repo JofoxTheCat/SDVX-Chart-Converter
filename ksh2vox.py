@@ -23,8 +23,16 @@ music_db.merged.xml.
 Only for legitimate use: your own or user-generated Nautica charts. Do not use it
 to extract or redistribute proprietary game data.
 """
-__version__ = "0.17.1"
+__version__ = "0.18.0"
 
+# 0.18.0 Skill radar from the chart editor's fitted model (radar_model.py +
+#        radar_model.json): 85 time-based pattern features, per-axis linear
+#        terms + regression trees fitted on the official charts. Against the
+#        official music_db (8,573 charts, song-grouped CV) MAE NOTES 0.10,
+#        PEAK 2.0, TSUMAMI 2.3, TRICKY 10.7, HAND-TRIP 2.8, ONE-HAND 3.2 —
+#        radar.py was at 13..43. Identical to the editor's values on every
+#        library chart. radar.py stays as --radar classic and as the fallback
+#        when the model is missing. Only <radar> values change.
 # 0.17.1 A ranged ksh `t=35-321` header is the display range only, never a
 #        tempo event (libkson); before, its low value sat at tick 0 next to
 #        the first inline tempo and radar.py counted that as a tempo change
@@ -142,10 +150,28 @@ import subprocess
 import traceback
 import unicodedata
 
-try:                              # skill radar (radar.py next to this script)
+try:                              # classic skill radar (radar.py next to this script)
     import radar as _radar
 except ImportError:               # keep working standalone; radar stays 0
     _radar = None
+try:                              # model skill radar (radar_model.py + radar_model.json)
+    import radar_model as _radar_model
+except ImportError:
+    # Loaded by file path (the V2 launcher bridge execs the addon scripts that
+    # way and hands in only the siblings it knows), this folder is not on
+    # sys.path: take radar_model.py from beside this file, never from
+    # anywhere else on sys.path.
+    _radar_model = None
+    try:
+        import importlib.util as _ilu
+        _rm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "radar_model.py")
+        if os.path.isfile(_rm_path):
+            _rm_spec = _ilu.spec_from_file_location("radar_model", _rm_path)
+            _radar_model = _ilu.module_from_spec(_rm_spec)
+            _rm_spec.loader.exec_module(_radar_model)
+    except Exception:             # a broken radar_model.py must not stop the converter
+        _radar_model = None
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -311,6 +337,23 @@ def convert_chart(ksh_path: str) -> dict:
     pending_width = [1, 1]         # laserrange_l/r=2x: widens the next section only
     laser_meta = [[], []]          # per section: {"wide", "curves", "filter"}
     open_width = [1, 1]
+    # Skill radar input (0.18.0), pulse-precise (240 per quarter, like kson and
+    # the chart editor): a line sits at round(index * measure / lines) pulses,
+    # which ticks (48 per quarter) cannot hold for a 40- or 36-line measure,
+    # and the radar's rhythm-grid features look at pulse mod 60 / 40. Recorded
+    # the way the editor's KshReader reads the same file; the VOX path never
+    # looks at it.
+    rin = {"notes": [], "lasers": None, "bpm": [], "stops": [],
+           "scroll": [], "end": None, "spins": 0}
+    r_bt_hold, r_fx_hold = [None] * 4, [None] * 2
+    r_open = [None, None]               # raw laser lines: [pulse, v 0..1, curve]
+    r_width = [1, 1]
+    r_sections = [[], []]               # per lane: (width, points)
+    r_curve = [None, None]              # laser_l/r_curve=a;b: (pulse, (a, b))
+    pulse = 0
+    hb = _num_or_none(header.get("t"))
+    if hb is not None:
+        _radar_set_bpm(rin["bpm"], 0, hb)
     # K-Shoot writes a curved ksh segment together with baked intermediate
     # points (the chart editor's KshReader documents this on ABYSS MOTION, the
     # only library chart with laser_*_curve), so a .ksh curve is already
@@ -322,8 +365,10 @@ def convert_chart(ksh_path: str) -> dict:
         chart_lines = [ln for ln in m if re.match(r"^[0-9\-:]{4}\|", ln)]
         n = len(chart_lines) or 1
         beat_events.append((mi, num, den))
+        plen = int(round(KSON_PPQN * 4 * num / den))       # measure in pulses
         li = 0
         for ln in m:
+            py = pulse + (2 * li * plen + n) // (2 * n)     # KshReader: round(li*len/n)
             mt = re.match(r"t=([0-9.]+)", ln)
             if mt and "-" not in ln:          # a ranged inline t= is no tempo either
                 bpm_events.append((tick + (li * ticks_in_measure // n), float(mt.group(1))))
@@ -332,7 +377,11 @@ def convert_chart(ksh_path: str) -> dict:
                     _ksh_option(parsed, ln, tick + (li * ticks_in_measure // n),
                                 fx_defs, filter_defs, fx_events, filter_events,
                                 tilt_events, cam, scroll, stops, pending_width)
+                    _radar_option(rin, ln, py, r_curve)
                 continue
+            # before the tick path below, which consumes pending_width
+            _radar_line(rin, ln, py, r_bt_hold, r_fx_hold, r_open, r_width,
+                        pending_width, r_sections, r_curve)
             t = tick + (li * ticks_in_measure // n)
             parts = ln.split("|")
             btf, fxf, las = parts[0], parts[1], parts[2] if len(parts) > 2 else "--"
@@ -387,6 +436,7 @@ def convert_chart(ksh_path: str) -> dict:
                     laser_open[k].append((t, v))
             li += 1
         tick += ticks_in_measure
+        pulse += plen
 
     # close any laser section still open at the end of the chart
     for k in range(2):
@@ -429,6 +479,20 @@ def convert_chart(ksh_path: str) -> dict:
         # no inline tempo at all: the header is all there is (range → low value)
         bpm_events.append((0, header_bpm[0]))
 
+    for k in range(4):                  # radar input: close at the chart end
+        if r_bt_hold[k] is not None:
+            rin["notes"].append((k, r_bt_hold[k], pulse - r_bt_hold[k]))
+    for k in range(2):
+        if r_fx_hold[k] is not None:
+            rin["notes"].append((4 + k, r_fx_hold[k], pulse - r_fx_hold[k]))
+        if r_open[k]:
+            r_sections[k].append((r_width[k], r_open[k]))
+    if not rin["bpm"]:
+        rin["bpm"].append((0, 120.0))
+    rin["stops"].sort(key=lambda e: e[0])
+    rin["end"] = pulse
+    rin["ksh_lasers"] = r_sections
+
     end_tick = tick
     parsed.update({
         "header": header,
@@ -441,8 +505,106 @@ def convert_chart(ksh_path: str) -> dict:
         "cam": cam,
         "scroll": scroll,
         "stops": stops,
+        "radar_input": rin,
     })
     return parsed
+
+
+# -- skill radar input of a .ksh (0.18.0) -------------------------------------
+# The model radar (radar_model.py) is a port of the chart editor's, so its
+# input mirrors how the editor's KshReader reads a file: pulses, the BPM list
+# as its SetBpm keeps it (same pulse = replaced, a ranged t= is no tempo),
+# stops in 192nds, scroll_speed as a graph, lane spins counted, and a
+# laser_l/r_curve kept on the point at its pulse.
+def _num_or_none(v):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def _radar_set_bpm(bpms: list, y: int, bpm: float) -> None:
+    bpms[:] = [b for b in bpms if b[0] != y]
+    bpms.append((y, bpm))
+    bpms.sort(key=lambda b: b[0])
+
+
+def _radar_option(rin: dict, line: str, y: int, r_curve: list) -> None:
+    key, value = (x.strip() for x in line.split("=", 1))
+    if key == "t":
+        v = _num_or_none(value)
+        if v is not None:
+            _radar_set_bpm(rin["bpm"], y, v)
+    elif key == "stop":
+        try:
+            rin["stops"].append((y, int(value) * 5))
+        except ValueError:
+            pass
+    elif key == "scroll_speed":
+        v = _num_or_none(value)
+        if v is not None:
+            g = rin["scroll"]
+            if g and g[-1][0] == y:
+                g[-1][2] = None if v == g[-1][1] else v
+            else:
+                g.append([y, v, None])
+    elif key in ("laser_l_curve", "laser_r_curve"):
+        p = value.split(";")
+        if len(p) == 2:
+            a, b = _num_or_none(p[0]), _num_or_none(p[1])
+            if a is not None and b is not None:
+                r_curve[0 if key[6] == "l" else 1] = (y, (a, b))
+
+
+def _radar_line(rin, ln, y, bt_hold, fx_hold, open_, width, pending_width,
+                sections, r_curve) -> None:
+    """One chart line -> radar input, in pulses. Same note/hold/section rules
+    as the tick path in convert_chart (and the editor's KshReader). Runs
+    before the tick path, so `pending_width` is read here, not consumed."""
+    parts = ln.split("|")
+    btf, fxf, las = parts[0], parts[1], parts[2] if len(parts) > 2 else "--"
+    for k in range(4):
+        c = btf[k]
+        if c != "2" and bt_hold[k] is not None:
+            rin["notes"].append((k, bt_hold[k], y - bt_hold[k]))
+            bt_hold[k] = None
+        if c == "1":
+            rin["notes"].append((k, y, 0))
+        elif c == "2" and bt_hold[k] is None:
+            bt_hold[k] = y
+    for k in range(2):
+        c = fxf[k]
+        if c != "1" and fx_hold[k] is not None:
+            rin["notes"].append((4 + k, fx_hold[k], y - fx_hold[k]))
+            fx_hold[k] = None
+        if c == "2":
+            rin["notes"].append((4 + k, y, 0))
+        elif c == "1" and fx_hold[k] is None:
+            fx_hold[k] = y
+    for k in range(2):
+        v = _laser_val(las[k] if k < len(las) else "-")
+        if v is None:
+            if open_[k]:
+                sections[k].append((width[k], open_[k]))
+            open_[k] = None
+        elif v != ":":
+            if open_[k] is None:
+                open_[k] = []
+                width[k] = pending_width[k]
+            curve = None
+            if r_curve[k] is not None and r_curve[k][0] == y:
+                curve = r_curve[k][1]
+                r_curve[k] = None
+            open_[k].append([y, v / 50.0, curve])
+    if len(las) > 2:                    # lane spin / half spin / swing
+        sfx = las[2:]
+        if len(sfx) >= 3 and sfx[0] in "@S" and sfx[1] in "()<>":
+            try:
+                int(sfx[2:].split(";")[0])
+                rin["spins"] += 1
+            except ValueError:
+                pass
 
 
 def _ksh_option(parsed, line, t, fx_defs, filter_defs, fx_events,
@@ -712,6 +874,9 @@ def convert_kson(path: str) -> dict:
         "explicit_slams": True,      # never infer slams from point spacing
         "laser_meta": laser_meta,
         "warnings": [],
+        # model radar input: raw kson pulses, read like the editor's KsonReader
+        "radar_input": (_radar_model.kson_input(doc)
+                        if _radar_model is not None else None),
     }
     _kson_extras(parsed, doc)
     if "bg_no" in parsed.get("vox_extras", {}):
@@ -2773,6 +2938,55 @@ def song_ascii_id(header: dict, sid: int) -> str:
     return f"nautica{sid}" if a == "song" else a   # all-non-ASCII → keep unique
 
 
+# -- skill radar selection (0.18.0) -------------------------------------------
+# "model" (default): radar_model.py, the chart editor's data-driven radar —
+# pattern features + per-axis models fitted on the official charts (MAE vs the
+# official music_db: NOTES 0.1, PEAK 2.0, TSUMAMI 2.3, TRICKY 10.7, HAND-TRIP
+# 2.8, ONE-HAND 3.2). "classic": radar.py (kshoot-tools formulas, MAE 13..43),
+# kept for comparison. Without radar_model.py / radar_model.json the model
+# falls back to classic with one warning per run.
+RADAR_MODE = "model"
+_radar_fallback_warned = False
+
+
+def set_radar_mode(mode: str) -> None:
+    """'model' or 'classic' — for importers (CLI: --radar)."""
+    global RADAR_MODE
+    if mode not in ("model", "classic"):
+        raise ValueError(f"unknown radar mode {mode!r}")
+    RADAR_MODE = mode
+
+
+def radar_engine() -> str:
+    """The radar that is actually used: 'model', 'classic' or 'none'."""
+    if RADAR_MODE == "model" and _radar_model is not None \
+            and _radar_model.load_model() is not None:
+        return "model"
+    return "classic" if _radar is not None else "none"
+
+
+def _radar_setting() -> str:
+    """Recorded per song in the import map: a different radar re-converts."""
+    return radar_engine()
+
+
+def compute_radar(parsed: dict):
+    """Radar values of one parsed chart, or None when no radar is available."""
+    global _radar_fallback_warned
+    engine = radar_engine()
+    if RADAR_MODE == "model" and engine != "model" and not _radar_fallback_warned:
+        _radar_fallback_warned = True
+        why = ("radar_model.py is missing" if _radar_model is None
+               else _radar_model.model_error())
+        print(f"  [WARN] model skill radar unavailable ({why}) — "
+              f"{'using the classic radar.py' if engine == 'classic' else 'radar values stay 0'}")
+    if engine == "model" and parsed.get("radar_input") is not None:
+        return _radar_model.compute(parsed)
+    if _radar is not None:
+        return _radar.compute(parsed)
+    return None
+
+
 def convert_song(folder: str, sid: int, out_root: str,
                  merged_path: str | None = None, db_encoding: str = "Shift_JIS",
                  progress=None):
@@ -2830,11 +3044,12 @@ def convert_song(folder: str, sid: int, out_root: str,
         levels[slot] = chart_level(parsed["header"])
         credits[slot] = (parsed["header"].get("effect", ""),
                          parsed["header"].get("illustrator", ""))
-        if _radar is not None:                  # skill radar for this chart
-            try:
-                radars[slot] = _radar.compute(parsed)
-            except Exception as e:
-                print(f"  [warn] radar failed for {kf}: {e}")
+        try:                                    # skill radar for this chart
+            rad = compute_radar(parsed)
+            if rad is not None:
+                radars[slot] = rad
+        except Exception as e:
+            print(f"  [warn] radar failed for {kf}: {e}")
         jsrc = place_jackets(folder, song_dir, sid, slot + 1,
                              parsed["header"].get("jacket"))
         _emit(progress, "jacket_done", folder=os.path.basename(folder),
@@ -3048,6 +3263,9 @@ def is_up_to_date(imap: dict, folder: str, out_root: str,
     # song converts — so a changed setting must invalidate the skip.
     if entry.get("tag") != _custom_tag_setting():
         return False
+    # Same for the radar: the values live in the db entry (0.18.0).
+    if entry.get("radar") != _radar_setting():
+        return False
     if entry.get("source") != folder_fingerprint(folder):
         return False
     ascii_id = entry.get("ascii")
@@ -3071,6 +3289,7 @@ def record_import(imap: dict, folder: str, sid: int, song_dir: str) -> None:
     entry["source"] = folder_fingerprint(folder)
     entry["converter"] = __version__
     entry["tag"] = _custom_tag_setting()
+    entry["radar"] = _radar_setting()
 
 
 def assign_song_id(imap: dict, folder: str, floor_id: int) -> tuple[int, bool]:
@@ -3291,19 +3510,40 @@ def main():
     ap.add_argument("--custom-tag-id", type=int, default=CUSTOM_TAG_ID,
                     help=f"tag id to write (default {CUSTOM_TAG_ID}; official "
                          "songs use 1..44)")
+    ap.add_argument("--radar", choices=("model", "classic"), default="model",
+                    help="skill radar: 'model' (default) = the chart editor's "
+                         "fitted radar (radar_model.py + radar_model.json, close "
+                         "to the official values); 'classic' = radar.py "
+                         "(kshoot-tools formulas), for comparison")
     ap.add_argument("--force", action="store_true",
                     help="convert even songs whose inputs are unchanged "
                          "(they are skipped by default). A converter version "
                          "bump already forces a re-convert on its own.")
     a = ap.parse_args()
 
+    set_radar_mode(a.radar)
     if a.self_check:
         print(f"ksh2vox {__version__}")
-        if _radar is None:
-            print("  skill radar : NOT AVAILABLE — radar.py is missing next to "
-                  "this script, so radar values will be written as 0")
+        if _radar_model is None:
+            print("  radar model : NOT AVAILABLE — radar_model.py is missing next "
+                  "to this script (falls back to the classic radar.py)")
+        elif _radar_model.load_model() is None:
+            print(f"  radar model : NOT AVAILABLE — {_radar_model.model_error()} "
+                  f"(falls back to the classic radar.py)")
         else:
-            print(f"  skill radar : radar.py {getattr(_radar, '__version__', '?')} loaded")
+            bad = _radar_model.self_check()
+            m = _radar_model.load_model()
+            print(f"  radar model : radar_model.py {_radar_model.__version__}, "
+                  f"radar_model.json {m.get('generated', '?')} "
+                  f"({m.get('training_charts', '?')} charts) — "
+                  + ("ok" if not bad else "FAILED — " + "; ".join(bad)))
+        if _radar is None:
+            print("  classic radar: NOT AVAILABLE — radar.py is missing next to "
+                  "this script")
+        else:
+            print(f"  classic radar: radar.py {getattr(_radar, '__version__', '?')} loaded")
+        print(f"  skill radar : {radar_engine()} is used "
+              f"(--radar {RADAR_MODE}){'' if radar_engine() != 'none' else ' — values will be 0'}")
         tpl = os.path.isfile(TEMPLATE)
         print(f"  template    : {'found' if tpl else 'MISSING'} ({TEMPLATE})")
         print(f"  audio       : {a.audio_format}, "
