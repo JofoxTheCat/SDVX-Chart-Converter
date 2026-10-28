@@ -23,7 +23,7 @@ music_db.merged.xml.
 Only for legitimate use: your own or user-generated Nautica charts. Do not use it
 to extract or redistribute proprietary game data.
 """
-__version__ = "0.20.1"
+__version__ = "0.20.2"
 
 # 0.20.1 Song ids above every real song over several --base-db (the plugin
 #        json lags behind the game); a tilt jump inside one manual stretch
@@ -173,28 +173,38 @@ import subprocess
 import traceback
 import unicodedata
 
-try:                              # classic skill radar (radar.py next to this script)
-    import radar as _radar
-except ImportError:               # keep working standalone; radar stays 0
-    _radar = None
-try:                              # model skill radar (radar_model.py + radar_model.json)
-    import radar_model as _radar_model
-except ImportError:
-    # Loaded by file path (the V2 launcher bridge execs the addon scripts that
-    # way and hands in only the siblings it knows), this folder is not on
-    # sys.path: take radar_model.py from beside this file, never from
-    # anywhere else on sys.path.
-    _radar_model = None
+
+def _sibling(name):
+    """Import radar / radar_model, the optional modules beside this script.
+
+    A plain import first: the V2 launcher bridge hands its siblings in through
+    sys.modules. When that fails this folder is not on sys.path - loaded by
+    file path (the bridge execs the addon scripts that way), or run by
+    Python's embeddable distribution, whose ._pth file keeps the script folder
+    off sys.path (until 0.20.2 radar.py then went missing and `--radar classic`
+    silently wrote 0). Then take <name>.py from beside this file, never from
+    anywhere else on sys.path. Missing or broken there = None; the converter
+    keeps working without it.
+    """
     try:
-        import importlib.util as _ilu
-        _rm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "radar_model.py")
-        if os.path.isfile(_rm_path):
-            _rm_spec = _ilu.spec_from_file_location("radar_model", _rm_path)
-            _radar_model = _ilu.module_from_spec(_rm_spec)
-            _rm_spec.loader.exec_module(_radar_model)
-    except Exception:             # a broken radar_model.py must not stop the converter
-        _radar_model = None
+        return __import__(name)
+    except ImportError:
+        pass
+    try:
+        import importlib.util as ilu
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name + ".py")
+        if not os.path.isfile(path):
+            return None
+        spec = ilu.spec_from_file_location(name, path)
+        mod = ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+_radar = _sibling("radar")               # classic skill radar
+_radar_model = _sibling("radar_model")   # model skill radar (+ radar_model.json)
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -4435,6 +4445,18 @@ def _max_existing_id(path: str) -> int:
 
 
 def main():
+    # Redirected to a file or pipe, Windows Python before 3.15 writes the locale code
+    # page (cp1252), which has no "→": the first progress line crashed the run
+    # (UnicodeEncodeError, measured with the embeddable 3.12). Files and pipes get
+    # UTF-8; a console keeps its encoding, both replace what they cannot show.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream.isatty():
+                stream.reconfigure(errors="replace")
+            else:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
     ap = argparse.ArgumentParser(
         description="sdvx-chart-importer — Nautica KSH → SDVX ∇ (VOX v13) + music_db")
     ap.add_argument("--self-check", action="store_true",

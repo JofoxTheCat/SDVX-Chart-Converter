@@ -11,6 +11,35 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.20.2] - 2026-10-28
+
+Bug-fix release for running ksh2vox with Python's embeddable distribution
+(which the SDVX Chart Editor's Windows package bundles) and for Windows CLI runs
+with redirected output. Default output is byte-identical to 0.20.1 (all 8
+library songs: every .vox, the merged db, audio and jackets; the import map
+differs only in `"converter"`); the version bump re-converts every song once.
+
+### Fixed
+- **`radar.py` was not found under the embeddable Python.** Its `._pth` file
+  keeps the script folder off `sys.path`, so `import radar` failed and
+  `--radar classic` (and the fallback when the model radar is missing) wrote 0
+  for every axis; `--self-check` said "radar.py is missing next to this
+  script" with the file right there. `radar_model.py` already had a
+  load-by-path fallback; both siblings now go through one loader,
+  `_sibling(name)`: a plain import first (the launcher bridge hands its
+  siblings in through `sys.modules`), else `<name>.py` from beside
+  `ksh2vox.py` only, missing or broken = None. Verified: embeddable 3.12.10
+  `--radar classic` over the library gives the same db as system Python
+  (before: all radar values 0); a module the bridge marks as None (missing or
+  broken file) stays None.
+- **CLI crashed on redirected output under Windows Python before 3.15.** A file
+  or pipe gets the locale code page (cp1252), which has no "→"; the first
+  `[id] real songs reach … → …` line raised `UnicodeEncodeError` and the
+  batch stopped before converting anything. `main()` now switches redirected
+  stdout/stderr to UTF-8 and lets both replace unprintable characters. The
+  launcher bridge and the editor's VOX host set UTF-8 themselves and were not
+  affected.
+
 ## [0.20.1] - 2026-10-27
 
 Bug-fix release: two faults found right after v0.20.0 was published (the
